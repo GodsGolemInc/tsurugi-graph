@@ -5,6 +5,7 @@
 #include <map>
 #include <algorithm>
 #include <cstring>
+#include <cstdint>
 
 namespace sharksfin {
 
@@ -36,11 +37,55 @@ struct Slice {
 using DatabaseHandle = void*;
 using TransactionHandle = void*;
 using StorageHandle = std::string*; // Mock storage handle as its name
+using IteratorHandle = void*;
 
 struct StorageOptions {};
 
 // Mock Global State
 inline std::map<std::string, std::map<std::string, std::string>> mock_db_state;
+inline std::map<void*, std::map<std::string, std::string>::iterator> mock_iterators;
+inline std::map<void*, std::map<std::string, std::string>::iterator> mock_iterators_end;
+
+inline std::map<void*, bool> mock_iterators_started;
+
+inline StatusCode content_scan(TransactionHandle, StorageHandle storage, Slice begin_key, int, Slice end_key, int, IteratorHandle* result) {
+    auto& s = mock_db_state[*storage];
+    auto it = s.lower_bound(begin_key.to_string());
+    static int iter_id = 0;
+    void* h = (void*)(uintptr_t)(++iter_id);
+    mock_iterators[h] = it;
+    mock_iterators_end[h] = s.end();
+    mock_iterators_started[h] = false;
+    *result = h;
+    return StatusCode::OK;
+}
+
+inline StatusCode iterator_next(IteratorHandle h) {
+    if (!mock_iterators_started[h]) {
+        mock_iterators_started[h] = true;
+        if (mock_iterators[h] == mock_iterators_end[h]) return StatusCode::NOT_FOUND;
+        return StatusCode::OK;
+    }
+    if (mock_iterators[h] == mock_iterators_end[h]) return StatusCode::NOT_FOUND;
+    ++mock_iterators[h];
+    if (mock_iterators[h] == mock_iterators_end[h]) return StatusCode::NOT_FOUND;
+    return StatusCode::OK;
+}
+
+inline StatusCode iterator_get_key(IteratorHandle h, Slice* result) {
+    auto it = mock_iterators[h];
+    if (it == mock_iterators_end[h]) return StatusCode::NOT_FOUND;
+    static std::string k;
+    k = it->first;
+    *result = Slice(k.data(), k.size());
+    return StatusCode::OK;
+}
+
+inline StatusCode iterator_dispose(IteratorHandle h) {
+    mock_iterators.erase(h);
+    mock_iterators_end.erase(h);
+    return StatusCode::OK;
+}
 
 inline StatusCode storage_create(TransactionHandle, Slice key, StorageOptions const&, StorageHandle* result) {
     std::string name = key.to_string();

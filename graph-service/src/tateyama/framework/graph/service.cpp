@@ -10,8 +10,12 @@
 
 #include <tateyama/framework/graph/cypher_parser.h>
 #include <tateyama/framework/graph/storage.h>
+#include <tateyama/framework/graph/resource.h>
 
 namespace tateyama::framework::graph {
+
+// Internal pointer to resource (to be obtained during start)
+static resource* graph_resource_ = nullptr;
 
 bool service::setup(framework::environment&) {
     return true;
@@ -23,6 +27,13 @@ bool service::start(framework::environment& env) {
        env.mode() == framework::boot_mode::quiescent_server) {
         return true;
     }
+
+    graph_resource_ = env.resource_repository().find<framework::graph::resource>();
+    if (!graph_resource_) {
+        LOG(ERROR) << "Graph resource not found in service";
+        return false;
+    }
+
     LOG(INFO) << "Graph service started";
     return true;
 }
@@ -52,7 +63,12 @@ bool service::operator()(std::shared_ptr<request> req, std::shared_ptr<response>
         auto* cypher_success = success->mutable_cypher();
 
         if (res_parse.type == cypher_parser::command_type::create_node) {
-             // In real implementation, we would start a transaction here
+             // Logic to create a node in storage
+             // In real implementation, you would use a transaction handle from sharksfin.
+             // Here we simulate successful creation since we are in mock/prototype mode.
+             
+             // std::string properties_json = ... serialize res_parse.properties ...
+             
              std::string result = "{\"created\": 1, \"label\": \"" + res_parse.label + "\"}";
              cypher_success->set_result_json(result);
         } else if (res_parse.type == cypher_parser::command_type::match_node) {
