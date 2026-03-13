@@ -8,6 +8,13 @@
 
 namespace tateyama::framework::graph {
 
+struct edge_data {
+    uint64_t from_id;
+    uint64_t to_id;
+    std::string label;
+    std::string properties;
+};
+
 class storage {
 public:
     static constexpr std::string_view STORAGE_NAME_NODES = "graph_nodes";
@@ -24,7 +31,8 @@ public:
     bool get_node(sharksfin::TransactionHandle tx, uint64_t node_id, std::string& out_properties);
 
     // Edge operations
-    // ... (To be implemented)
+    bool create_edge(sharksfin::TransactionHandle tx, uint64_t from_id, uint64_t to_id, std::string_view label, std::string_view properties, uint64_t& out_id);
+    bool get_edge(sharksfin::TransactionHandle tx, uint64_t edge_id, edge_data& out_edge);
 
 private:
     sharksfin::StorageHandle nodes_handle_{};

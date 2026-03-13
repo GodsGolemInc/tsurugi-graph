@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include <cstring>
 #include <iostream>
+#include <sstream>
 
 namespace tateyama::framework::graph {
 
@@ -10,80 +11,85 @@ using namespace sharksfin;
 bool storage::init(DatabaseHandle db_handle, TransactionHandle tx_handle) {
     if (!db_handle) return false;
 
-    // Create/Open storage for Nodes
     StorageOptions options;
     StatusCode rc = storage_create(tx_handle, Slice(STORAGE_NAME_NODES), options, &nodes_handle_);
     if (rc != StatusCode::OK && rc != StatusCode::ALREADY_EXISTS) {
-        LOG(ERROR) << "Failed to create node storage: " << rc;
         return false;
     }
-    // If it already exists, we need to open it (storage_create usually handles open if existing, but API might differ slightly)
     if (rc == StatusCode::ALREADY_EXISTS) {
-        rc = storage_get(tx_handle, Slice(STORAGE_NAME_NODES), &nodes_handle_);
-        if (rc != StatusCode::OK) {
-             LOG(ERROR) << "Failed to open existing node storage: " << rc;
-             return false;
-        }
+        storage_get(tx_handle, Slice(STORAGE_NAME_NODES), &nodes_handle_);
     }
 
-    // Create/Open storage for Edges (Similar logic)
     rc = storage_create(tx_handle, Slice(STORAGE_NAME_EDGES), options, &edges_handle_);
     if (rc != StatusCode::OK && rc != StatusCode::ALREADY_EXISTS) {
-        LOG(ERROR) << "Failed to create edge storage: " << rc;
         return false;
     }
     if (rc == StatusCode::ALREADY_EXISTS) {
-        rc = storage_get(tx_handle, Slice(STORAGE_NAME_EDGES), &edges_handle_);
-        if (rc != StatusCode::OK) {
-             LOG(ERROR) << "Failed to open existing edge storage: " << rc;
-             return false;
-        }
+        storage_get(tx_handle, Slice(STORAGE_NAME_EDGES), &edges_handle_);
     }
 
     return true;
 }
 
 static uint64_t generate_id() {
-    // Ideally use sequence_get from sharksfin, but for prototype we use simple counter or random
     static uint64_t counter = 1;
     return counter++;
 }
 
 bool storage::create_node(TransactionHandle tx, std::string_view properties, uint64_t& out_id) {
     if (!tx || !nodes_handle_) return false;
-
     out_id = generate_id();
-    
-    // Key: Node ID (uint64_t big endian for sort order, but sharksfin slice is byte array)
-    // We need to serialize uint64_t to Slice.
-    uint64_t key_val = out_id; // Simple copy for now. Real implementation should handle endianness if needed.
+    uint64_t key_val = out_id;
     Slice key(&key_val, sizeof(key_val));
     Slice value(properties.data(), properties.size());
-
-    StatusCode rc = content_put(tx, nodes_handle_, key, value, PutOperation::CREATE);
-    if (rc != StatusCode::OK) {
-        LOG(ERROR) << "Failed to put node: " << rc;
-        return false;
-    }
-    return true;
+    return content_put(tx, nodes_handle_, key, value, PutOperation::CREATE) == StatusCode::OK;
 }
 
 bool storage::get_node(TransactionHandle tx, uint64_t node_id, std::string& out_properties) {
     if (!tx || !nodes_handle_) return false;
-
     uint64_t key_val = node_id;
     Slice key(&key_val, sizeof(key_val));
     Slice value;
-
-    StatusCode rc = content_get(tx, nodes_handle_, key, &value);
-    if (rc == StatusCode::NOT_FOUND) {
-        return false;
-    }
-    if (rc != StatusCode::OK) {
-        LOG(ERROR) << "Failed to get node: " << rc;
-        return false;
-    }
+    if (content_get(tx, nodes_handle_, key, &value) != StatusCode::OK) return false;
     out_properties.assign(value.data<char>(), value.size());
+    return true;
+}
+
+bool storage::create_edge(TransactionHandle tx, uint64_t from_id, uint64_t to_id, std::string_view label, std::string_view properties, uint64_t& out_id) {
+    if (!tx || !edges_handle_) return false;
+    out_id = generate_id();
+    uint64_t key_val = out_id;
+    Slice key(&key_val, sizeof(key_val));
+
+    // Simple serialization: [from_id][to_id][label_size][label][properties]
+    std::string val_buf;
+    val_buf.append(reinterpret_cast<char*>(&from_id), sizeof(from_id));
+    val_buf.append(reinterpret_cast<char*>(&to_id), sizeof(to_id));
+    uint32_t label_size = static_cast<uint32_t>(label.size());
+    val_buf.append(reinterpret_cast<char*>(&label_size), sizeof(label_size));
+    val_buf.append(label);
+    val_buf.append(properties);
+
+    Slice value(val_buf.data(), val_buf.size());
+    return content_put(tx, edges_handle_, key, value, PutOperation::CREATE) == StatusCode::OK;
+}
+
+bool storage::get_edge(TransactionHandle tx, uint64_t edge_id, edge_data& out_edge) {
+    if (!tx || !edges_handle_) return false;
+    uint64_t key_val = edge_id;
+    Slice key(&key_val, sizeof(key_val));
+    Slice value;
+    if (content_get(tx, edges_handle_, key, &value) != StatusCode::OK) return false;
+
+    const char* ptr = value.data<char>();
+    size_t offset = 0;
+    std::memcpy(&out_edge.from_id, ptr + offset, sizeof(uint64_t)); offset += sizeof(uint64_t);
+    std::memcpy(&out_edge.to_id, ptr + offset, sizeof(uint64_t)); offset += sizeof(uint64_t);
+    uint32_t label_size;
+    std::memcpy(&label_size, ptr + offset, sizeof(uint32_t)); offset += sizeof(uint32_t);
+    out_edge.label.assign(ptr + offset, label_size); offset += label_size;
+    out_edge.properties.assign(ptr + offset, value.size() - offset);
+    
     return true;
 }
 
