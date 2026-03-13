@@ -8,43 +8,10 @@
 #include <tateyama/proto/graph/request.pb.h>
 #include <tateyama/proto/graph/response.pb.h>
 
+#include <tateyama/framework/graph/cypher_parser.h>
 #include <tateyama/framework/graph/storage.h>
-#include <regex>
 
 namespace tateyama::framework::graph {
-
-// Internal helper for simple parsing
-struct cypher_parser {
-    enum class command_type {
-        create_node,
-        match_node,
-        unknown
-    };
-
-    std::string label;
-    std::string properties;
-
-    command_type parse(const std::string& query) {
-        // Simple regex for CREATE (n:Label {prop: val})
-        // Note: Very limited parser for prototype
-        std::regex create_pattern(R"(CREATE\s*\(\w+:(\w+)\s*(\{.*\})\))");
-        std::smatch match;
-        if (std::regex_search(query, match, create_pattern)) {
-            if (match.size() > 2) {
-                label = match[1];
-                properties = match[2];
-                return command_type::create_node;
-            }
-        }
-        
-        // Simple regex for MATCH (n) RETURN n
-        if (query.find("MATCH (n) RETURN n") != std::string::npos) {
-             return command_type::match_node;
-        }
-
-        return command_type::unknown;
-    }
-};
 
 bool service::setup(framework::environment&) {
     return true;
@@ -79,22 +46,19 @@ bool service::operator()(std::shared_ptr<request> req, std::shared_ptr<response>
         LOG(INFO) << "Received Cypher query: " << cypher.query();
         
         cypher_parser parser;
-        auto type = parser.parse(cypher.query());
+        auto res_parse = parser.parse(cypher.query());
         
         auto* success = proto_res.mutable_success();
         auto* cypher_success = success->mutable_cypher();
 
-        if (type == cypher_parser::command_type::create_node) {
-             // In real implementation, we would start a transaction here,
-             // call storage::create_node, and commit.
-             // Here we simulate success.
-             std::string result = "{\"created\": 1, \"label\": \"" + parser.label + "\"}";
+        if (res_parse.type == cypher_parser::command_type::create_node) {
+             // In real implementation, we would start a transaction here
+             std::string result = "{\"created\": 1, \"label\": \"" + res_parse.label + "\"}";
              cypher_success->set_result_json(result);
-        } else if (type == cypher_parser::command_type::match_node) {
-             // Simulate returning all nodes
+        } else if (res_parse.type == cypher_parser::command_type::match_node) {
              cypher_success->set_result_json("{\"nodes\": []}");
         } else {
-             cypher_success->set_result_json("{\"status\": \"not_implemented_or_syntax_error\"}");
+             cypher_success->set_result_json("{\"status\": \"syntax_error_or_not_supported\"}");
         }
 
     } else {

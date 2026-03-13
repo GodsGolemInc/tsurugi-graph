@@ -16,7 +16,7 @@ public:
     std::shared_ptr<service> service_;
 };
 
-TEST_F(service_test, cypher_create_parse) {
+TEST_F(service_test, cypher_create_integration) {
     auto req = std::make_shared<tateyama::api::server::mock::request>();
     auto res = std::make_shared<tateyama::api::server::mock::response>();
 
@@ -34,9 +34,8 @@ TEST_F(service_test, cypher_create_parse) {
     proto_res.ParseFromString(res->body_);
     
     EXPECT_TRUE(proto_res.has_success());
-    // In mock implementation, we expect a success message with "created"
-    EXPECT_NE(proto_res.success().cypher().result_json().find("created"), std::string::npos);
-    EXPECT_NE(proto_res.success().cypher().result_json().find("Person"), std::string::npos);
+    EXPECT_NE(proto_res.success().cypher().result_json().find("\"created\": 1"), std::string::npos);
+    EXPECT_NE(proto_res.success().cypher().result_json().find("\"label\": \"Person\""), std::string::npos);
 }
 
 } // namespace tateyama::framework::graph
