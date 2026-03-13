@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package tateyama.proto.graph.request;
+
+message Request {
+    oneof command {
+        CypherRequest cypher = 1;
+        // Node/Edge CRUD for lower-level API
+        NodeGetRequest node_get = 2;
+        EdgeGetRequest edge_get = 3;
+    }
+}
+
+message CypherRequest {
+    string query = 1;
+    map<string, string> parameters = 2;
+}
+
+message NodeGetRequest {
+    uint64 node_id = 1;
+}
+
+message EdgeGetRequest {
+    uint64 edge_id = 1;
+}
