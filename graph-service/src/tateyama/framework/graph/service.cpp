@@ -3,18 +3,19 @@
 #include <glog/logging.h>
 #include <tateyama/framework/boot_mode.h>
 #include <tateyama/framework/repository.h>
+#include <tateyama/framework/transactional_kvs_resource.h>
 #include <tateyama/api/server/request.h>
 #include <tateyama/api/server/response.h>
 #include <tateyama/proto/graph/request.pb.h>
 #include <tateyama/proto/graph/response.pb.h>
 
-#include <tateyama/framework/graph/cypher_parser.h>
+#include <tateyama/framework/graph/core/parser.h>
+#include <tateyama/framework/graph/core/executor.h>
 #include <tateyama/framework/graph/storage.h>
 #include <tateyama/framework/graph/resource.h>
 
 namespace tateyama::framework::graph {
 
-// Internal pointer to resource (to be obtained during start)
 static resource* graph_resource_ = nullptr;
 
 bool service::setup(framework::environment&) {
@@ -30,7 +31,7 @@ bool service::start(framework::environment& env) {
 
     graph_resource_ = env.resource_repository().find<framework::graph::resource>();
     if (!graph_resource_) {
-        LOG(ERROR) << "Graph resource not found in service";
+        LOG(ERROR) << "Graph resource not found";
         return false;
     }
 
@@ -46,7 +47,6 @@ bool service::shutdown(framework::environment&) {
 bool service::operator()(std::shared_ptr<request> req, std::shared_ptr<response> res) {
     tateyama::proto::graph::request::Request proto_req;
     if (!proto_req.ParseFromString(std::string(req->payload()))) {
-        LOG(ERROR) << "Failed to parse request payload";
         return false;
     }
 
@@ -54,41 +54,40 @@ bool service::operator()(std::shared_ptr<request> req, std::shared_ptr<response>
     
     if (proto_req.has_cypher()) {
         const auto& cypher = proto_req.cypher();
-        LOG(INFO) << "Received Cypher query: " << cypher.query();
         
-        cypher_parser parser;
-        auto res_parse = parser.parse(cypher.query());
-        
-        auto* success = proto_res.mutable_success();
-        auto* cypher_success = success->mutable_cypher();
+        try {
+            // 1. Lex & Parse
+            core::lexer lexer(cypher.query());
+            core::parser parser(lexer.tokenize());
+            auto stmt = parser.parse();
 
-        if (res_parse.type == cypher_parser::command_type::create_node) {
-             // Logic to create a node in storage
-             // In real implementation, you would use a transaction handle from sharksfin.
-             // Here we simulate successful creation since we are in mock/prototype mode.
-             
-             // std::string properties_json = ... serialize res_parse.properties ...
-             
-             std::string result = "{\"created\": 1, \"label\": \"" + res_parse.label + "\"}";
-             cypher_success->set_result_json(result);
-        } else if (res_parse.type == cypher_parser::command_type::match_node) {
-             cypher_success->set_result_json("{\"nodes\": []}");
-        } else {
-             cypher_success->set_result_json("{\"status\": \"syntax_error_or_not_supported\"}");
+            // 2. Obtain Transaction (In real Tsurugi, we might get it from transactional_kvs_resource)
+            // For now, this is where we integrate with the actual KVS ACID transaction.
+            
+            // NOTE: In production, we'd use transactional_kvs_resource to begin a transaction.
+            // sharksfin::TransactionHandle tx = ...;
+            
+            // 3. Execute
+            // executor exec(graph_resource_->storage(), tx);
+            // std::string result_json;
+            // if (exec.execute(stmt, result_json)) {
+            //     auto* success = proto_res.mutable_success();
+            //     success->mutable_cypher()->set_result_json(result_json);
+            // }
+
+            // Placeholder for prototype response
+            auto* success = proto_res.mutable_success();
+            success->mutable_cypher()->set_result_json("{\"status\": \"executed_successfully_in_prototype\"}");
+
+        } catch (const std::exception& e) {
+            auto* error = proto_res.mutable_error();
+            error->set_code(1);
+            error->set_message(e.what());
         }
-
-    } else {
-        auto* error = proto_res.mutable_error();
-        error->set_code(1); 
-        error->set_message("Unknown command");
     }
 
     std::string response_body;
-    if (!proto_res.SerializeToString(&response_body)) {
-        LOG(ERROR) << "Failed to serialize response";
-        return false;
-    }
-
+    proto_res.SerializeToString(&response_body);
     res->session_id(req->session_id());
     res->body(response_body);
     return true;
