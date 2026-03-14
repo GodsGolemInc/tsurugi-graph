@@ -13,10 +13,12 @@
 #include <tateyama/framework/graph/core/executor.h>
 #include <tateyama/framework/graph/storage.h>
 #include <tateyama/framework/graph/resource.h>
+#include <sharksfin/api.h>
 
 namespace tateyama::framework::graph {
 
 static resource* graph_resource_ = nullptr;
+static sharksfin::DatabaseHandle db_handle_ = nullptr;
 
 bool service::setup(framework::environment&) {
     return true;
@@ -30,12 +32,15 @@ bool service::start(framework::environment& env) {
     }
 
     graph_resource_ = env.resource_repository().find<framework::graph::resource>();
-    if (!graph_resource_) {
-        LOG(ERROR) << "Graph resource not found";
+    auto kvs_resource = env.resource_repository().find<framework::transactional_kvs_resource>();
+    
+    if (!graph_resource_ || !kvs_resource) {
+        LOG(ERROR) << "Required resources (graph or transactional_kvs) not found";
         return false;
     }
 
-    LOG(INFO) << "Graph service started";
+    db_handle_ = kvs_resource->core_object();
+    LOG(INFO) << "Graph service started with real database handle";
     return true;
 }
 
@@ -55,34 +60,42 @@ bool service::operator()(std::shared_ptr<request> req, std::shared_ptr<response>
     if (proto_req.has_cypher()) {
         const auto& cypher = proto_req.cypher();
         
-        try {
-            // 1. Lex & Parse
-            core::lexer lexer(cypher.query());
-            core::parser parser(lexer.tokenize());
-            auto stmt = parser.parse();
-
-            // 2. Obtain Transaction (In real Tsurugi, we might get it from transactional_kvs_resource)
-            // For now, this is where we integrate with the actual KVS ACID transaction.
-            
-            // NOTE: In production, we'd use transactional_kvs_resource to begin a transaction.
-            // sharksfin::TransactionHandle tx = ...;
-            
-            // 3. Execute
-            // executor exec(graph_resource_->storage(), tx);
-            // std::string result_json;
-            // if (exec.execute(stmt, result_json)) {
-            //     auto* success = proto_res.mutable_success();
-            //     success->mutable_cypher()->set_result_json(result_json);
-            // }
-
-            // Placeholder for prototype response
-            auto* success = proto_res.mutable_success();
-            success->mutable_cypher()->set_result_json("{\"status\": \"executed_successfully_in_prototype\"}");
-
-        } catch (const std::exception& e) {
+        // 1. Transaction Begin (Real ACID Transaction)
+        sharksfin::TransactionHandle tx{};
+        sharksfin::TransactionOptions options{}; // Default options (OCC in Shirakami)
+        if (sharksfin::transaction_begin(db_handle_, options, &tx) != sharksfin::StatusCode::OK) {
             auto* error = proto_res.mutable_error();
-            error->set_code(1);
-            error->set_message(e.what());
+            error->set_code(100);
+            error->set_message("Failed to begin transaction");
+        } else {
+            try {
+                // 2. Lex & Parse
+                core::lexer lexer(cypher.query());
+                core::parser parser(lexer.tokenize());
+                auto stmt = parser.parse();
+
+                // 3. Execute within Transaction
+                core::executor exec(graph_resource_->storage(), tx);
+                std::string result_json;
+                if (exec.execute(stmt, result_json)) {
+                    // 4. Commit
+                    if (sharksfin::transaction_commit(tx) == sharksfin::StatusCode::OK) {
+                        auto* success = proto_res.mutable_success();
+                        success->mutable_cypher()->set_result_json(result_json);
+                    } else {
+                        throw std::runtime_error("Failed to commit transaction");
+                    }
+                } else {
+                    sharksfin::transaction_abort(tx);
+                    throw std::runtime_error("Execution failed");
+                }
+            } catch (const std::exception& e) {
+                sharksfin::transaction_abort(tx);
+                auto* error = proto_res.mutable_error();
+                error->set_code(1);
+                error->set_message(e.what());
+            }
+            sharksfin::transaction_dispose(tx);
         }
     }
 
