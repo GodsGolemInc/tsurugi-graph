@@ -41,12 +41,34 @@ using DatabaseHandle = void*;
 using TransactionHandle = void*;
 using StorageHandle = std::string*; // Mock storage handle as its name
 using IteratorHandle = void*;
+using SequenceHandle = std::string*;
 
 struct StorageOptions {};
 struct TransactionOptions {};
 
 // Mock Global State
 inline std::map<std::string, std::map<std::string, std::string>> mock_db_state;
+inline std::map<std::string, uint64_t> mock_sequences;
+
+inline StatusCode sequence_create(DatabaseHandle, Slice key, SequenceHandle* result) {
+    std::string name = key.to_string();
+    if (mock_sequences.count(name)) return StatusCode::ALREADY_EXISTS;
+    mock_sequences[name] = 1;
+    *result = new std::string(name);
+    return StatusCode::OK;
+}
+
+inline StatusCode sequence_get(DatabaseHandle, Slice key, SequenceHandle* result) {
+    std::string name = key.to_string();
+    if (!mock_sequences.count(name)) return StatusCode::NOT_FOUND;
+    *result = new std::string(name);
+    return StatusCode::OK;
+}
+
+inline StatusCode sequence_next(TransactionHandle, SequenceHandle h, uint64_t* result) {
+    *result = mock_sequences[*h]++;
+    return StatusCode::OK;
+}
 inline std::map<void*, std::map<std::string, std::string>::iterator> mock_iterators;
 inline std::map<void*, std::map<std::string, std::string>::iterator> mock_iterators_end;
 inline std::map<void*, bool> mock_iterators_started;

@@ -9,7 +9,6 @@ namespace tateyama::framework::graph {
 
 using namespace sharksfin;
 
-// Helper to convert uint64 to big-endian bytes for lexicographical sorting
 static std::string to_key(uint64_t val) {
     uint64_t be = __builtin_bswap64(val);
     std::string s;
@@ -35,21 +34,38 @@ bool storage::init(DatabaseHandle db_handle, TransactionHandle tx_handle) {
         return rc == StatusCode::OK;
     };
 
-    return init_storage(STORAGE_NAME_NODES, nodes_handle_) &&
-           init_storage(STORAGE_NAME_EDGES, edges_handle_) &&
-           init_storage(STORAGE_NAME_OUT_INDEX, out_index_handle_) &&
-           init_storage(STORAGE_NAME_IN_INDEX, in_index_handle_);
+    if (!init_storage(STORAGE_NAME_NODES, nodes_handle_) ||
+        !init_storage(STORAGE_NAME_EDGES, edges_handle_) ||
+        !init_storage(STORAGE_NAME_OUT_INDEX, out_index_handle_) ||
+        !init_storage(STORAGE_NAME_IN_INDEX, in_index_handle_) ||
+        !init_storage(STORAGE_NAME_LABEL_INDEX, label_index_handle_)) {
+        return false;
+    }
+
+    // Initialize/Get Persistent Sequence
+    if (sequence_create(db_handle, Slice(SEQUENCE_NAME), &sequence_handle_) == StatusCode::ALREADY_EXISTS) {
+        sequence_get(db_handle, Slice(SEQUENCE_NAME), &sequence_handle_);
+    }
+
+    return true;
 }
 
-static uint64_t generate_id() {
-    static uint64_t counter = 1;
-    return counter++;
-}
-
-bool storage::create_node(TransactionHandle tx, std::string_view properties, uint64_t& out_id) {
+bool storage::create_node(TransactionHandle tx, std::string_view label, std::string_view properties, uint64_t& out_id) {
     if (!tx || !nodes_handle_) return false;
-    out_id = generate_id();
-    return content_put(tx, nodes_handle_, to_key(out_id), properties, PutOperation::CREATE) == StatusCode::OK;
+    
+    // Get next ID from persistent sequence
+    if (sequence_next(tx, sequence_handle_, &out_id) != StatusCode::OK) return false;
+
+    // 1. Store node data
+    if (content_put(tx, nodes_handle_, to_key(out_id), properties, PutOperation::CREATE) != StatusCode::OK) return false;
+
+    // 2. Update Label Index: [label][node_id] -> (empty)
+    if (!label.empty()) {
+        std::string label_key = std::string(label) + to_key(out_id);
+        content_put(tx, label_index_handle_, label_key, Slice(), PutOperation::CREATE);
+    }
+
+    return true;
 }
 
 bool storage::get_node(TransactionHandle tx, uint64_t node_id, std::string& out_properties) {
@@ -62,9 +78,8 @@ bool storage::get_node(TransactionHandle tx, uint64_t node_id, std::string& out_
 
 bool storage::create_edge(TransactionHandle tx, uint64_t from_id, uint64_t to_id, std::string_view label, std::string_view properties, uint64_t& out_id) {
     if (!tx || !edges_handle_) return false;
-    out_id = generate_id();
+    if (sequence_next(tx, sequence_handle_, &out_id) != StatusCode::OK) return false;
     
-    // 1. Store edge data
     std::string val_buf;
     uint64_t be_from = __builtin_bswap64(from_id);
     uint64_t be_to = __builtin_bswap64(to_id);
@@ -76,13 +91,11 @@ bool storage::create_edge(TransactionHandle tx, uint64_t from_id, uint64_t to_id
     val_buf.append(properties);
     if (content_put(tx, edges_handle_, to_key(out_id), val_buf, PutOperation::CREATE) != StatusCode::OK) return false;
 
-    // 2. Update Out-Index: [from_id][edge_id] -> [to_id]
     std::string out_key = to_key(from_id) + to_key(out_id);
-    if (content_put(tx, out_index_handle_, out_key, to_key(to_id), PutOperation::CREATE) != StatusCode::OK) return false;
+    content_put(tx, out_index_handle_, out_key, to_key(to_id), PutOperation::CREATE);
 
-    // 3. Update In-Index: [to_id][edge_id] -> [from_id]
     std::string in_key = to_key(to_id) + to_key(out_id);
-    if (content_put(tx, in_index_handle_, in_key, to_key(from_id), PutOperation::CREATE) != StatusCode::OK) return false;
+    content_put(tx, in_index_handle_, in_key, to_key(from_id), PutOperation::CREATE);
 
     return true;
 }
@@ -104,19 +117,33 @@ bool storage::get_edge(TransactionHandle tx, uint64_t edge_id, edge_data& out_ed
 
 bool storage::get_outgoing_edges(TransactionHandle tx, uint64_t node_id, std::vector<uint64_t>& out_edge_ids) {
     if (!tx || !out_index_handle_) return false;
-    
     std::string prefix = to_key(node_id);
     IteratorHandle it;
     if (content_scan(tx, out_index_handle_, prefix, 0, prefix, 0, &it) != StatusCode::OK) return false;
-
     while (iterator_next(it) == StatusCode::OK) {
         Slice key;
         iterator_get_key(it, &key);
         if (key.size() < 16) continue;
         std::string k = key.to_string();
-        if (k.substr(0, 8) != prefix) break; // End of range
-        uint64_t edge_id = from_key(k.substr(8, 8));
-        out_edge_ids.push_back(edge_id);
+        if (k.substr(0, 8) != prefix) break;
+        out_edge_ids.push_back(from_key(k.substr(8, 8)));
+    }
+    iterator_dispose(it);
+    return true;
+}
+
+bool storage::find_nodes_by_label(TransactionHandle tx, std::string_view label, std::vector<uint64_t>& out_node_ids) {
+    if (!tx || !label_index_handle_) return false;
+    std::string prefix(label);
+    IteratorHandle it;
+    if (content_scan(tx, label_index_handle_, prefix, 0, prefix, 0, &it) != StatusCode::OK) return false;
+    while (iterator_next(it) == StatusCode::OK) {
+        Slice key;
+        iterator_get_key(it, &key);
+        std::string k = key.to_string();
+        if (k.size() <= prefix.size()) continue;
+        if (k.substr(0, prefix.size()) != prefix) break;
+        out_node_ids.push_back(from_key(k.substr(prefix.size())));
     }
     iterator_dispose(it);
     return true;
