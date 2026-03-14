@@ -9,10 +9,13 @@
 
 namespace sharksfin {
 
-enum class StatusCode {
+enum class StatusCode : std::int64_t {
     OK = 0,
     NOT_FOUND = 1,
     ALREADY_EXISTS = 2,
+    ERR_SERIALIZATION_FAILURE = 10,
+    ERR_CONFLICT_ON_WRITE_PRESERVE = 11,
+    ERR_WAITING_FOR_OTHER_TRANSACTION = 12,
     ERR_UNKNOWN = 99
 };
 
@@ -40,13 +43,31 @@ using StorageHandle = std::string*; // Mock storage handle as its name
 using IteratorHandle = void*;
 
 struct StorageOptions {};
+struct TransactionOptions {};
 
 // Mock Global State
 inline std::map<std::string, std::map<std::string, std::string>> mock_db_state;
 inline std::map<void*, std::map<std::string, std::string>::iterator> mock_iterators;
 inline std::map<void*, std::map<std::string, std::string>::iterator> mock_iterators_end;
-
 inline std::map<void*, bool> mock_iterators_started;
+
+inline int mock_commit_failure_count = 0;
+
+inline StatusCode transaction_begin(DatabaseHandle, TransactionOptions const&, TransactionHandle* result) {
+    *result = (void*)0xbeef;
+    return StatusCode::OK;
+}
+
+inline StatusCode transaction_commit(TransactionHandle) {
+    if (mock_commit_failure_count > 0) {
+        mock_commit_failure_count--;
+        return StatusCode::ERR_SERIALIZATION_FAILURE;
+    }
+    return StatusCode::OK;
+}
+
+inline StatusCode transaction_abort(TransactionHandle) { return StatusCode::OK; }
+inline StatusCode transaction_dispose(TransactionHandle) { return StatusCode::OK; }
 
 inline StatusCode content_scan(TransactionHandle, StorageHandle storage, Slice begin_key, int, Slice end_key, int, IteratorHandle* result) {
     auto& s = mock_db_state[*storage];
