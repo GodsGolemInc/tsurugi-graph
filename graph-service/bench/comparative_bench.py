@@ -207,6 +207,33 @@ def run_neo4j_bench(conn, N):
                 ).consume()
     results.append(bench(f"{db_name}: CREATE node", N, create_nodes))
 
+    # 1b. UNWIND bulk insert (batch of 100 nodes per query)
+    # First cleanup the individual creates
+    with driver.session() as s:
+        s.run("MATCH (n) DETACH DELETE n").consume()
+
+    batch_size = 100
+    unwind_batches = N // batch_size
+    def unwind_bulk():
+        with driver.session() as s:
+            for b in range(unwind_batches):
+                rows = [{"name": f"U{b*batch_size+j}", "age": 20 + (b*batch_size+j) % 60}
+                        for j in range(batch_size)]
+                label = "Person"
+                s.run(
+                    f"UNWIND $rows AS row CREATE (n:{label} {{name: row.name, age: row.age}})",
+                    rows=rows
+                ).consume()
+    results.append(bench(f"{db_name}: UNWIND bulk insert ({batch_size}/batch)", N, unwind_bulk))
+
+    # Re-create with proper Person/Company labels for subsequent tests
+    with driver.session() as s:
+        s.run("MATCH (n) DETACH DELETE n").consume()
+        for i in range(N):
+            label = "Person" if i % 2 == 0 else "Company"
+            s.run(f"CREATE (n:{label} {{name: $name, age: $age}})",
+                  name=f"U{i}", age=20 + i % 60).consume()
+
     # 2. Create index for WHERE benchmarks
     with driver.session() as s:
         try:
@@ -288,6 +315,32 @@ def run_falkordb_bench(conn, N):
             label = "Person" if i % 2 == 0 else "Company"
             g.query(f"CREATE (:{label} {{name: 'U{i}', age: {20 + i % 60}}})")
     results.append(bench(f"{db_name}: CREATE node", N, create_nodes))
+
+    # 1b. UNWIND bulk insert
+    try:
+        g.query("MATCH (n) DETACH DELETE n")
+    except Exception:
+        pass
+
+    batch_size = 100
+    unwind_batches = N // batch_size
+    def unwind_bulk():
+        for b in range(unwind_batches):
+            items = ", ".join(
+                f"{{name: 'U{b*batch_size+j}', age: {20 + (b*batch_size+j) % 60}}}"
+                for j in range(batch_size)
+            )
+            g.query(f"UNWIND [{items}] AS row CREATE (n:Person {{name: row.name, age: row.age}})")
+    results.append(bench(f"{db_name}: UNWIND bulk insert ({batch_size}/batch)", N, unwind_bulk))
+
+    # Re-create with proper Person/Company labels
+    try:
+        g.query("MATCH (n) DETACH DELETE n")
+    except Exception:
+        pass
+    for i in range(N):
+        label = "Person" if i % 2 == 0 else "Company"
+        g.query(f"CREATE (:{label} {{name: 'U{i}', age: {20 + i % 60}}})")
 
     # 2. Create index
     try:

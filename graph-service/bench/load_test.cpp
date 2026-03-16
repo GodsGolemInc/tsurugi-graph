@@ -127,6 +127,62 @@ int main(int argc, char** argv) {
         }));
     }
 
+    // ------- 4b. Cypher UNWIND bulk insert -------
+    {
+        reset_mock();
+        storage s;
+        void* db = (void*)0x1; void* tx = (void*)0x2;
+        s.init(db, tx);
+        int batch_size = 100;
+        long long batches = std::min(N / batch_size, (long long)10000);
+        long long total_nodes = batches * batch_size;
+        results.push_back(run_bench("Cypher: UNWIND bulk insert (100/batch)", total_nodes, [&]() {
+            for (long long b = 0; b < batches; ++b) {
+                std::string list = "[";
+                for (int j = 0; j < batch_size; ++j) {
+                    if (j > 0) list += ", ";
+                    long long idx = b * batch_size + j;
+                    list += "{name: 'U" + std::to_string(idx) + "', age: " + std::to_string(20 + idx % 60) + "}";
+                }
+                list += "]";
+                std::string q = "UNWIND " + list + " AS item CREATE (n:Person {name: item.name, age: item.age})";
+                lexer l(q);
+                parser p(l.tokenize());
+                executor exec(s, tx);
+                std::string r;
+                exec.execute(p.parse(), r);
+            }
+        }));
+    }
+
+    // ------- 4c. Cypher CREATE edge (MATCH+CREATE) -------
+    {
+        reset_mock();
+        storage s;
+        void* db = (void*)0x1; void* tx = (void*)0x2;
+        s.init(db, tx);
+        int node_count = std::min(N, (long long)100000);
+        // Pre-populate nodes with Person (even) and Company (odd)
+        for (int i = 0; i < node_count; ++i) {
+            uint64_t id;
+            std::string label = (i % 2 == 0) ? "Person" : "Company";
+            s.create_node(tx, label, "{\"name\": \"U" + std::to_string(i) + "\"}", id);
+        }
+        long long edge_n = std::min(N, (long long)10000);
+        results.push_back(run_bench("Cypher: CREATE edge (MATCH+CREATE)", edge_n, [&]() {
+            for (long long i = 0; i < edge_n; ++i) {
+                std::string q = "MATCH (a:Person {name: 'U" + std::to_string((i * 2) % node_count) +
+                                "'}), (b:Company {name: 'U" + std::to_string((i * 2 + 1) % node_count) +
+                                "'}) CREATE (a)-[:WORKS_AT]->(b)";
+                lexer l(q);
+                parser p(l.tokenize());
+                executor exec(s, tx);
+                std::string r;
+                exec.execute(p.parse(), r);
+            }
+        }));
+    }
+
     // ------- 5. Label index scan -------
     {
         reset_mock();

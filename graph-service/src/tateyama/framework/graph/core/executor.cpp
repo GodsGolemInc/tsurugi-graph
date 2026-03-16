@@ -178,11 +178,68 @@ bool executor::execute_match(const std::shared_ptr<match_clause>& match) {
         auto& first_node = path.elements[0].node;
 
         if (!first_node->label.empty()) {
-            std::vector<uint64_t> ids;
-            if (store_.find_nodes_by_label(tx_, first_node->label, ids)) {
-                if (!first_node->variable.empty()) {
-                    context_[first_node->variable] = std::move(ids);
-                    context_labels_[first_node->variable] = first_node->label;
+            bool used_index = false;
+
+            // Optimization: use property index for inline property match (e.g., MATCH (n:Person {name: 'Alice'}))
+            if (!first_node->properties.empty()) {
+                // Try each property for index lookup (first string literal wins)
+                for (auto& [key, expr] : first_node->properties) {
+                    if (auto lit = std::dynamic_pointer_cast<literal>(expr)) {
+                        std::vector<uint64_t> index_ids;
+                        if (store_.find_nodes_by_property(tx_, first_node->label, key, lit->value, index_ids)) {
+                            // Filter by remaining properties if any
+                            if (first_node->properties.size() > 1) {
+                                std::vector<uint64_t> filtered;
+                                for (uint64_t id : index_ids) {
+                                    std::string props;
+                                    if (!store_.get_node(tx_, id, props)) continue;
+                                    bool all_match = true;
+                                    for (auto& [k2, e2] : first_node->properties) {
+                                        if (k2 == key) continue;
+                                        if (auto lit2 = std::dynamic_pointer_cast<literal>(e2)) {
+                                            std::string val = get_json_value(props, k2);
+                                            if (val != lit2->value) { all_match = false; break; }
+                                        }
+                                    }
+                                    if (all_match) filtered.push_back(id);
+                                }
+                                index_ids = std::move(filtered);
+                            }
+                            if (!first_node->variable.empty()) {
+                                context_[first_node->variable] = std::move(index_ids);
+                                context_labels_[first_node->variable] = first_node->label;
+                            }
+                            used_index = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!used_index) {
+                std::vector<uint64_t> ids;
+                if (store_.find_nodes_by_label(tx_, first_node->label, ids)) {
+                    // Filter by inline properties if present
+                    if (!first_node->properties.empty()) {
+                        std::vector<uint64_t> filtered;
+                        for (uint64_t id : ids) {
+                            std::string props;
+                            if (!store_.get_node(tx_, id, props)) continue;
+                            bool all_match = true;
+                            for (auto& [key, expr] : first_node->properties) {
+                                if (auto lit = std::dynamic_pointer_cast<literal>(expr)) {
+                                    std::string val = get_json_value(props, key);
+                                    if (val != lit->value) { all_match = false; break; }
+                                }
+                            }
+                            if (all_match) filtered.push_back(id);
+                        }
+                        ids = std::move(filtered);
+                    }
+                    if (!first_node->variable.empty()) {
+                        context_[first_node->variable] = std::move(ids);
+                        context_labels_[first_node->variable] = first_node->label;
+                    }
                 }
             }
         }
