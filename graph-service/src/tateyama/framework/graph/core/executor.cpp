@@ -1,127 +1,102 @@
 #include <tateyama/framework/graph/core/executor.h>
-#include <sstream>
-#include <iostream>
+#include <algorithm>
+#include <cstring>
+#include <set>
+#include <thread>
 
 namespace tateyama::framework::graph::core {
 
 bool executor::execute(const statement& stmt, std::string& result_json) {
     for (const auto& clause : stmt.clauses) {
-        if (clause->type() == clause_type::create) {
-            if (!execute_create(std::dynamic_pointer_cast<create_clause>(clause))) return false;
-        } else if (clause->type() == clause_type::match) {
-            if (!execute_match(std::dynamic_pointer_cast<match_clause>(clause))) return false;
-        } else if (clause->type() == clause_type::return_clause) {
-            if (!execute_return(std::dynamic_pointer_cast<return_clause>(clause), result_json)) return false;
+        switch (clause->type()) {
+            case clause_type::create:
+                if (!execute_create(std::dynamic_pointer_cast<create_clause>(clause))) return false;
+                break;
+            case clause_type::match:
+                if (!execute_match(std::dynamic_pointer_cast<match_clause>(clause))) return false;
+                break;
+            case clause_type::where:
+                if (!execute_where(std::dynamic_pointer_cast<where_clause>(clause))) return false;
+                break;
+            case clause_type::return_clause:
+                if (!execute_return(std::dynamic_pointer_cast<return_clause>(clause), result_json)) return false;
+                break;
+            case clause_type::delete_clause:
+                if (!execute_delete(std::dynamic_pointer_cast<delete_clause>(clause))) return false;
+                break;
+            case clause_type::set_clause:
+                if (!execute_set(std::dynamic_pointer_cast<set_clause>(clause))) return false;
+                break;
         }
     }
     return true;
 }
 
 std::string executor::evaluate_properties(const std::map<std::string, std::shared_ptr<expression>>& props) {
-    std::stringstream ss;
-    ss << "{";
+    std::string result;
+    result.reserve(props.size() * 32); // rough estimate
+    result += '{';
     bool first = true;
     for (const auto& [key, expr] : props) {
-        if (!first) ss << ", ";
+        if (!first) result += ", ";
         first = false;
-        ss << "\"" << key << "\": ";
+        result += '"';
+        result += key;
+        result += "\": ";
         if (expr->type() == node_type::literal_string) {
             auto lit = std::dynamic_pointer_cast<literal>(expr);
-            ss << "\"" << lit->value << "\"";
+            result += '"';
+            result += lit->value;
+            result += '"';
         } else if (expr->type() == node_type::literal_number) {
             auto lit = std::dynamic_pointer_cast<literal>(expr);
-            ss << lit->value;
+            result += lit->value;
         }
-        // TODO: handle variables
     }
-    ss << "}";
-    return ss.str();
+    result += '}';
+    return result;
 }
 
 bool executor::execute_create(const std::shared_ptr<create_clause>& create) {
     for (const auto& path : create->paths) {
-        uint64_t last_node_id = 0;
-        
-        for (const auto& elem : path.elements) {
-            // Process Node
+        for (size_t i = 0; i < path.elements.size(); ++i) {
+            auto& elem = path.elements[i];
+
             uint64_t node_id = 0;
-            // Check if variable exists in context
-            if (!elem.node->variable.empty() && context_.count(elem.node->variable)) {
-                node_id = context_[elem.node->variable];
+            if (!elem.node->variable.empty() && context_.count(elem.node->variable) && !context_[elem.node->variable].empty()) {
+                node_id = context_[elem.node->variable][0];
             } else {
-                // Create new node
                 std::string props = evaluate_properties(elem.node->properties);
-                // TODO: Store label as well
-                if (!store_.create_node(tx_, props, node_id)) return false;
+                if (!store_.create_node(tx_, elem.node->label, props, node_id)) return false;
                 if (!elem.node->variable.empty()) {
-                    context_[elem.node->variable] = node_id;
+                    context_[elem.node->variable] = {node_id};
                 }
             }
 
-            // Process Relationship (if exists and connected to previous node)
-            if (last_node_id != 0 && elem.relationship) { // This element has a relationship pointing to... wait, logic is tricky
-                // pattern_path structure: Node, Rel, Node
-                // In my AST: Element has Node and Optional Rel TO NEXT Node?
-                // Actually my AST structure was: vector<element>. element = node + optional rel.
-                // It means: (Node1)-[Rel1]->(Node2)-[Rel2]->...
-                // So when processing elem N, we look at elem N-1's relationship?
-                // Let's re-check AST logic.
-                // parser::parse_pattern_path:
-                //   elem1 (Node1) pushed.
-                //   if rel:
-                //     rel parsed.
-                //     elem2 (Node2) parsed.
-                //     elem1.relationship = rel.
-                //     elem2 pushed.
-                // So, if we are at elem2, we need to look back at elem1 to see if there is a relationship connecting elem1 and elem2.
-            }
-        }
-
-        // Re-iterating with index to handle relationships properly
-        for (size_t i = 0; i < path.elements.size(); ++i) {
-            auto& elem = path.elements[i];
-            
-            // Get or Create Node
-            uint64_t node_id = 0;
-            if (!elem.node->variable.empty() && context_.count(elem.node->variable)) {
-                node_id = context_[elem.node->variable];
-            } else {
-                std::string props = evaluate_properties(elem.node->properties);
-                if (!store_.create_node(tx_, props, node_id)) return false;
-                if (!elem.node->variable.empty()) context_[elem.node->variable] = node_id;
-            }
-
-            // If there is a relationship from this node to the next
             if (elem.relationship && i + 1 < path.elements.size()) {
-                 auto& next_elem = path.elements[i+1];
-                 
-                 // Ensure next node is created/resolved (it will be in next iteration, but we need ID now)
-                 // This implies we should resolve all nodes first or resolve lazily?
-                 // Cypher CREATE (a)-[:REL]->(b) creates both a and b.
-                 // So we must resolve next node now.
-                 
-                 uint64_t next_node_id = 0;
-                 if (!next_elem.node->variable.empty() && context_.count(next_elem.node->variable)) {
-                     next_node_id = context_[next_elem.node->variable];
-                 } else {
-                     std::string props = evaluate_properties(next_elem.node->properties);
-                     if (!store_.create_node(tx_, props, next_node_id)) return false;
-                     if (!next_elem.node->variable.empty()) context_[next_elem.node->variable] = next_node_id;
-                 }
+                auto& next_elem = path.elements[i + 1];
+                uint64_t next_node_id = 0;
 
-                 // Create Edge
-                 uint64_t edge_id;
-                 std::string rel_props = evaluate_properties(elem.relationship->properties);
-                 
-                 // Direction handling
-                 uint64_t from = node_id;
-                 uint64_t to = next_node_id;
-                 if (elem.relationship->direction == "<-") {
-                     std::swap(from, to);
-                 }
-                 
-                 if (!store_.create_edge(tx_, from, to, elem.relationship->type, rel_props, edge_id)) return false;
-                 if (!elem.relationship->variable.empty()) context_[elem.relationship->variable] = edge_id;
+                if (!next_elem.node->variable.empty() && context_.count(next_elem.node->variable) && !context_[next_elem.node->variable].empty()) {
+                    next_node_id = context_[next_elem.node->variable][0];
+                } else {
+                    std::string props = evaluate_properties(next_elem.node->properties);
+                    if (!store_.create_node(tx_, next_elem.node->label, props, next_node_id)) return false;
+                    if (!next_elem.node->variable.empty()) {
+                        context_[next_elem.node->variable] = {next_node_id};
+                    }
+                }
+
+                uint64_t edge_id;
+                std::string rel_props = evaluate_properties(elem.relationship->properties);
+                uint64_t from = node_id;
+                uint64_t to = next_node_id;
+                if (elem.relationship->direction == "<-") std::swap(from, to);
+
+                if (!store_.create_edge(tx_, from, to, elem.relationship->type, rel_props, edge_id)) return false;
+                if (!elem.relationship->variable.empty()) {
+                    context_[elem.relationship->variable] = {edge_id};
+                }
             }
         }
     }
@@ -129,56 +104,482 @@ bool executor::execute_create(const std::shared_ptr<create_clause>& create) {
 }
 
 bool executor::execute_match(const std::shared_ptr<match_clause>& match) {
-    // Very simplified MATCH implementation: Full scan or scan all edges?
-    // Prototype: Support MATCH (n) only (Scan all nodes)
-    // Or MATCH (n)-[r]->(m)
-    
-    // For now, let's implement just iterating all nodes and binding to variable if it's a simple MATCH (n)
-    // Real implementation needs a query planner.
-    
-    return true; 
-}
+    for (const auto& path : match->paths) {
+        if (path.elements.empty()) continue;
 
-bool executor::execute_return(const std::shared_ptr<return_clause>& ret, std::string& result_json) {
-    // Retrieve values from context and storage
-    std::stringstream ss;
-    ss << "[";
-    
-    // Just dump one result for now (context state)
-    // Real Return needs iteration over result set (Match results)
-    
-    ss << "{";
-    bool first = true;
-    for (const auto& item : ret->items) {
-        if (!first) ss << ", ";
-        first = false;
-        
-        std::string alias = item.alias;
-        
-        if (item.expr->type() == node_type::variable) {
-            auto var = std::dynamic_pointer_cast<variable>(item.expr);
-            if (alias.empty()) alias = var->name;
-            
-            ss << "\"" << alias << "\": ";
-            if (context_.count(var->name)) {
-                uint64_t id = context_[var->name];
-                // Fetch from storage to get properties
-                std::string props;
-                if (store_.get_node(tx_, id, props)) {
-                     ss << props; // Dump raw json properties
-                } else {
-                     ss << "null";
+        auto& first_node = path.elements[0].node;
+
+        if (!first_node->label.empty()) {
+            std::vector<uint64_t> ids;
+            if (store_.find_nodes_by_label(tx_, first_node->label, ids)) {
+                if (!first_node->variable.empty()) {
+                    context_[first_node->variable] = std::move(ids);
+                    context_labels_[first_node->variable] = first_node->label;
                 }
-            } else {
-                ss << "null";
+            }
+        }
+
+        // Multi-hop match
+        if (path.elements.size() > 1) {
+            // Cache label lookups to avoid repeated index scans
+            std::map<std::string, std::set<uint64_t>> label_cache;
+
+            for (size_t i = 0; i < path.elements.size() - 1; ++i) {
+                auto& elem = path.elements[i];
+                if (!elem.relationship) continue;
+
+                auto& prev_var = elem.node->variable;
+                if (prev_var.empty() || !context_.count(prev_var)) continue;
+
+                auto& next_node = path.elements[i + 1].node;
+
+                // Pre-cache label set if needed
+                if (!next_node->label.empty() && label_cache.find(next_node->label) == label_cache.end()) {
+                    std::vector<uint64_t> label_ids;
+                    store_.find_nodes_by_label(tx_, next_node->label, label_ids);
+                    label_cache[next_node->label] = std::set<uint64_t>(label_ids.begin(), label_ids.end());
+                }
+
+                std::vector<uint64_t> next_ids;
+                for (uint64_t src_id : context_[prev_var]) {
+                    std::vector<uint64_t> edge_ids;
+                    bool is_outgoing = (elem.relationship->direction != "<-");
+
+                    if (is_outgoing) {
+                        store_.get_outgoing_edges(tx_, src_id, edge_ids);
+                    } else {
+                        store_.get_incoming_edges(tx_, src_id, edge_ids);
+                    }
+
+                    for (uint64_t eid : edge_ids) {
+                        edge_data ed;
+                        if (!store_.get_edge(tx_, eid, ed)) continue;
+
+                        if (!elem.relationship->type.empty() && ed.label != elem.relationship->type) continue;
+
+                        uint64_t target_id = is_outgoing ? ed.to_id : ed.from_id;
+
+                        if (!next_node->label.empty()) {
+                            auto& label_set = label_cache[next_node->label];
+                            if (label_set.find(target_id) == label_set.end()) continue;
+                        }
+
+                        next_ids.push_back(target_id);
+
+                        if (!elem.relationship->variable.empty()) {
+                            context_[elem.relationship->variable].push_back(eid);
+                        }
+                    }
+                }
+
+                if (!next_node->variable.empty()) {
+                    context_[next_node->variable] = std::move(next_ids);
+                    if (!next_node->label.empty()) {
+                        context_labels_[next_node->variable] = next_node->label;
+                    }
+                }
             }
         }
     }
-    ss << "}";
-    
-    ss << "]";
-    result_json = ss.str();
     return true;
+}
+
+bool executor::execute_where(const std::shared_ptr<where_clause>& where) {
+    if (where->variable.empty() || where->property.empty()) return true;
+
+    auto it = context_.find(where->variable);
+    if (it == context_.end()) return true;
+
+    std::string compare_value;
+    bool is_numeric = false;
+    double compare_numeric = 0;
+    if (where->value) {
+        if (auto lit = std::dynamic_pointer_cast<literal>(where->value)) {
+            compare_value = lit->value;
+            if (!lit->is_string) {
+                is_numeric = true;
+                try { compare_numeric = std::stod(compare_value); } catch (...) { is_numeric = false; }
+            }
+        }
+    }
+
+    const std::string& prop_key = where->property;
+    const std::string& op = where->op;
+
+    // ADR-0002: Use property index for equality lookups
+    if (op == "=") {
+        auto label_it = context_labels_.find(where->variable);
+        if (label_it != context_labels_.end() && !label_it->second.empty()) {
+            std::vector<uint64_t> index_results;
+            if (store_.find_nodes_by_property(tx_, label_it->second, prop_key, compare_value, index_results)) {
+                // Intersect index results with current context
+                std::set<uint64_t> index_set(index_results.begin(), index_results.end());
+                std::vector<uint64_t> filtered;
+                filtered.reserve(std::min(it->second.size(), index_results.size()));
+                for (uint64_t id : it->second) {
+                    if (index_set.count(id)) {
+                        filtered.push_back(id);
+                    }
+                }
+                it->second = std::move(filtered);
+                return true;
+            }
+            // Fall through to full scan if index lookup fails
+        }
+    }
+
+    // Full scan path (for inequality operators or when no label/index available)
+    auto& ids = it->second;
+    std::vector<uint64_t> filtered;
+
+    // ADR-0005: Parallel execution for large candidate sets
+    if (ids.size() >= PARALLEL_THRESHOLD) {
+        size_t num_threads = std::min(
+            static_cast<size_t>(std::thread::hardware_concurrency()),
+            ids.size() / 1000);
+        num_threads = std::max(num_threads, static_cast<size_t>(2));
+
+        std::vector<std::vector<uint64_t>> per_thread_results(num_threads);
+        std::vector<std::thread> threads;
+        size_t chunk = (ids.size() + num_threads - 1) / num_threads;
+
+        for (size_t t = 0; t < num_threads; ++t) {
+            size_t begin = t * chunk;
+            size_t end = std::min(begin + chunk, ids.size());
+            if (begin >= ids.size()) break;
+
+            threads.emplace_back([&, begin, end, t]() {
+                auto& local = per_thread_results[t];
+                for (size_t i = begin; i < end; ++i) {
+                    std::string props;
+                    if (!store_.get_node(tx_, ids[i], props)) continue;
+                    std::string val = get_json_value(props, prop_key);
+                    if (val.empty()) continue;
+
+                    bool match_result = false;
+                    if (op == "=") {
+                        match_result = (val == compare_value);
+                    } else if (is_numeric) {
+                        double node_val;
+                        try { node_val = std::stod(val); } catch (...) { continue; }
+                        if (op == ">") match_result = node_val > compare_numeric;
+                        else if (op == "<") match_result = node_val < compare_numeric;
+                        else if (op == "<>") match_result = node_val != compare_numeric;
+                    } else {
+                        if (op == ">") match_result = val > compare_value;
+                        else if (op == "<") match_result = val < compare_value;
+                        else if (op == "<>") match_result = val != compare_value;
+                    }
+
+                    if (match_result) local.push_back(ids[i]);
+                }
+            });
+        }
+
+        for (auto& th : threads) th.join();
+
+        for (auto& r : per_thread_results) {
+            filtered.insert(filtered.end(), r.begin(), r.end());
+        }
+    } else {
+        // Single-threaded path for small candidate sets
+        filtered.reserve(ids.size());
+        for (uint64_t id : ids) {
+            std::string props;
+            if (!store_.get_node(tx_, id, props)) continue;
+
+            std::string val = get_json_value(props, prop_key);
+            if (val.empty()) continue;
+
+            bool match_result = false;
+            if (op == "=") {
+                match_result = (val == compare_value);
+            } else if (is_numeric) {
+                double node_val;
+                try { node_val = std::stod(val); } catch (...) { continue; }
+                if (op == ">") match_result = node_val > compare_numeric;
+                else if (op == "<") match_result = node_val < compare_numeric;
+                else if (op == "<>") match_result = node_val != compare_numeric;
+            } else {
+                if (op == ">") match_result = val > compare_value;
+                else if (op == "<") match_result = val < compare_value;
+                else if (op == "<>") match_result = val != compare_value;
+            }
+
+            if (match_result) {
+                filtered.push_back(id);
+            }
+        }
+    }
+
+    it->second = std::move(filtered);
+    return true;
+}
+
+bool executor::execute_return(const std::shared_ptr<return_clause>& ret, std::string& result_json) {
+    size_t max_rows = 1;
+
+    // Collect all variable names referenced in RETURN items
+    std::set<std::string> needed_vars;
+    for (const auto& item : ret->items) {
+        std::string var_name;
+        if (item.expr->type() == node_type::variable) {
+            var_name = std::dynamic_pointer_cast<variable>(item.expr)->name;
+        } else if (item.expr->type() == node_type::property_access) {
+            var_name = std::dynamic_pointer_cast<property_access>(item.expr)->variable_name;
+        }
+        if (!var_name.empty()) {
+            needed_vars.insert(var_name);
+            auto it = context_.find(var_name);
+            if (it != context_.end()) {
+                max_rows = std::max(max_rows, it->second.size());
+            }
+        }
+    }
+
+    // ADR-0004: Batch-read all node properties upfront
+    std::map<std::string, std::map<uint64_t, std::string>> var_props_cache;
+    for (const auto& var_name : needed_vars) {
+        auto it = context_.find(var_name);
+        if (it == context_.end()) continue;
+        std::vector<std::pair<uint64_t, std::string>> batch;
+        store_.get_nodes_batch(tx_, it->second, batch);
+        auto& cache = var_props_cache[var_name];
+        for (auto& [id, props] : batch) {
+            cache[id] = std::move(props);
+        }
+    }
+
+    // Pre-allocate output
+    result_json.clear();
+    result_json.reserve(max_rows * ret->items.size() * 64);
+    result_json += '[';
+
+    for (size_t row = 0; row < max_rows; ++row) {
+        if (row > 0) result_json += ", ";
+        result_json += '{';
+        bool first = true;
+        for (const auto& item : ret->items) {
+            if (!first) result_json += ", ";
+            first = false;
+
+            if (item.expr->type() == node_type::variable) {
+                auto var = std::dynamic_pointer_cast<variable>(item.expr);
+                const std::string& alias = item.alias.empty() ? var->name : item.alias;
+                result_json += '"';
+                result_json += alias;
+                result_json += "\": ";
+
+                auto it = context_.find(var->name);
+                if (it != context_.end() && row < it->second.size()) {
+                    uint64_t id = it->second[row];
+                    auto& cache = var_props_cache[var->name];
+                    auto cache_it = cache.find(id);
+                    if (cache_it != cache.end() && !cache_it->second.empty()) {
+                        result_json += cache_it->second;
+                    } else {
+                        edge_data ed;
+                        if (store_.get_edge(tx_, id, ed)) {
+                            result_json += "{\"_id\": ";
+                            result_json += std::to_string(id);
+                            result_json += ", \"_from\": ";
+                            result_json += std::to_string(ed.from_id);
+                            result_json += ", \"_to\": ";
+                            result_json += std::to_string(ed.to_id);
+                            result_json += ", \"_label\": \"";
+                            result_json += ed.label;
+                            result_json += '"';
+                            if (!ed.properties.empty() && ed.properties != "{}") {
+                                result_json += ", \"_properties\": ";
+                                result_json += ed.properties;
+                            }
+                            result_json += '}';
+                        } else {
+                            result_json += "null";
+                        }
+                    }
+                } else {
+                    result_json += "null";
+                }
+            } else if (item.expr->type() == node_type::property_access) {
+                auto pa = std::dynamic_pointer_cast<property_access>(item.expr);
+                const std::string& alias = item.alias.empty() ? pa->variable_name + "." + pa->property_key : item.alias;
+                result_json += '"';
+                result_json += alias;
+                result_json += "\": ";
+
+                auto it = context_.find(pa->variable_name);
+                if (it != context_.end() && row < it->second.size()) {
+                    uint64_t id = it->second[row];
+                    auto& cache = var_props_cache[pa->variable_name];
+                    auto cache_it = cache.find(id);
+                    std::string props;
+                    if (cache_it != cache.end()) {
+                        props = cache_it->second;
+                    }
+                    if (!props.empty()) {
+                        std::string val = get_json_value(props, pa->property_key);
+                        if (!val.empty()) {
+                            bool is_num = !val.empty() && (std::isdigit(static_cast<unsigned char>(val[0])) || val[0] == '-');
+                            if (is_num) {
+                                result_json += val;
+                            } else {
+                                result_json += '"';
+                                result_json += val;
+                                result_json += '"';
+                            }
+                        } else {
+                            result_json += "null";
+                        }
+                    } else {
+                        result_json += "null";
+                    }
+                } else {
+                    result_json += "null";
+                }
+            }
+        }
+        result_json += '}';
+    }
+    result_json += ']';
+    return true;
+}
+
+bool executor::execute_delete(const std::shared_ptr<delete_clause>& del) {
+    for (const auto& var_name : del->variables) {
+        auto it = context_.find(var_name);
+        if (it == context_.end()) continue;
+
+        for (uint64_t id : it->second) {
+            std::string props;
+            if (store_.get_node(tx_, id, props) && !props.empty()) {
+                if (del->detach) {
+                    std::vector<uint64_t> out_edges, in_edges;
+                    store_.get_outgoing_edges(tx_, id, out_edges);
+                    store_.get_incoming_edges(tx_, id, in_edges);
+                    for (uint64_t eid : out_edges) store_.delete_edge(tx_, eid);
+                    for (uint64_t eid : in_edges) store_.delete_edge(tx_, eid);
+                }
+                store_.delete_node(tx_, id, "");
+            } else {
+                store_.delete_edge(tx_, id);
+            }
+        }
+        context_.erase(it);
+    }
+    return true;
+}
+
+bool executor::execute_set(const std::shared_ptr<set_clause>& set) {
+    for (const auto& asgn : set->assignments) {
+        auto it = context_.find(asgn.variable);
+        if (it == context_.end()) continue;
+
+        std::string new_value;
+        bool is_string = false;
+        if (auto lit = std::dynamic_pointer_cast<literal>(asgn.value)) {
+            new_value = lit->value;
+            is_string = lit->is_string;
+        }
+
+        for (uint64_t id : it->second) {
+            std::string props;
+            if (!store_.get_node(tx_, id, props)) continue;
+
+            std::string updated = update_json_property(props, asgn.property, new_value, is_string);
+            store_.update_node(tx_, id, updated);
+        }
+    }
+    return true;
+}
+
+std::string executor::get_json_value(const std::string& json, const std::string& key) {
+    // Fast path: search for "key": pattern
+    const size_t key_len = key.size();
+    size_t pos = 0;
+
+    while (pos < json.size()) {
+        pos = json.find('"', pos);
+        if (pos == std::string::npos) return "";
+        pos++; // skip opening quote
+
+        // Check if this key matches
+        if (pos + key_len < json.size() &&
+            json[pos + key_len] == '"' &&
+            std::memcmp(json.data() + pos, key.data(), key_len) == 0) {
+
+            pos += key_len + 1; // skip key and closing quote
+            // Skip to colon
+            while (pos < json.size() && json[pos] != ':') pos++;
+            if (pos >= json.size()) return "";
+            pos++; // skip ':'
+
+            // Skip whitespace
+            while (pos < json.size() && json[pos] == ' ') pos++;
+            if (pos >= json.size()) return "";
+
+            if (json[pos] == '"') {
+                size_t end = json.find('"', pos + 1);
+                if (end == std::string::npos) return "";
+                return json.substr(pos + 1, end - pos - 1);
+            } else {
+                size_t end = pos;
+                while (end < json.size() && json[end] != ',' && json[end] != '}' && json[end] != ' ') end++;
+                return json.substr(pos, end - pos);
+            }
+        }
+
+        // Skip to next quote pair
+        pos = json.find('"', pos);
+        if (pos == std::string::npos) return "";
+        pos++; // skip closing quote of this key or value string
+    }
+    return "";
+}
+
+std::string executor::update_json_property(const std::string& json, const std::string& key, const std::string& value, bool is_string) {
+    std::string search = "\"" + key + "\"";
+    auto pos = json.find(search);
+
+    std::string new_val = is_string ? ("\"" + value + "\"") : value;
+
+    if (pos != std::string::npos) {
+        auto colon = json.find(':', pos + search.size());
+        if (colon == std::string::npos) return json;
+        colon++;
+        while (colon < json.size() && json[colon] == ' ') colon++;
+
+        size_t val_end;
+        if (json[colon] == '"') {
+            val_end = json.find('"', colon + 1);
+            if (val_end != std::string::npos) val_end++;
+        } else {
+            val_end = colon;
+            while (val_end < json.size() && json[val_end] != ',' && json[val_end] != '}') val_end++;
+        }
+
+        std::string result;
+        result.reserve(json.size() + new_val.size());
+        result.append(json, 0, colon);
+        result += new_val;
+        result.append(json, val_end);
+        return result;
+    } else {
+        auto closing = json.rfind('}');
+        if (closing == std::string::npos) return json;
+        std::string result;
+        result.reserve(json.size() + key.size() + new_val.size() + 8);
+        result.append(json, 0, closing);
+        if (closing > 1 && json[closing - 1] != '{') {
+            result += ", ";
+        }
+        result += '"';
+        result += key;
+        result += "\": ";
+        result += new_val;
+        result += '}';
+        return result;
+    }
 }
 
 } // namespace tateyama::framework::graph::core

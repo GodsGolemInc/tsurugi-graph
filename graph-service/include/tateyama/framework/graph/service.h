@@ -9,8 +9,12 @@
 #include <tateyama/framework/component_ids.h>
 #include <tateyama/framework/environment.h>
 #include <tateyama/framework/service.h>
+#include <sharksfin/api.h>
+#include <tateyama/framework/graph/core/query_cache.h>
 
 namespace tateyama::framework::graph {
+
+class resource;
 
 using tateyama::api::server::request;
 using tateyama::api::server::response;
@@ -41,6 +45,18 @@ public:
     }
 
     ~service() override = default;
+
+private:
+    resource* graph_resource_ = nullptr;
+    sharksfin::DatabaseHandle db_handle_ = nullptr;
+
+    static constexpr int MAX_RETRIES = 5;
+    static constexpr int INITIAL_BACKOFF_MS = 10;
+
+    static bool is_retryable(sharksfin::StatusCode code);
+
+    // Query cache (ADR-0003)
+    core::query_cache query_cache_;
 };
 
 } // namespace tateyama::framework::graph

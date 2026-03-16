@@ -44,7 +44,9 @@ using IteratorHandle = void*;
 using SequenceHandle = std::string*;
 
 struct StorageOptions {};
-struct TransactionOptions {};
+struct TransactionOptions {
+    void add_write_preserve(Slice) {} // no-op in mock
+};
 
 // Mock Global State
 inline std::map<std::string, std::map<std::string, std::string>> mock_db_state;
@@ -118,7 +120,7 @@ inline StatusCode iterator_next(IteratorHandle h) {
 inline StatusCode iterator_get_key(IteratorHandle h, Slice* result) {
     auto it = mock_iterators[h];
     if (it == mock_iterators_end[h]) return StatusCode::NOT_FOUND;
-    static std::string k;
+    thread_local std::string k;
     k = it->first;
     *result = Slice(k.data(), k.size());
     return StatusCode::OK;
@@ -157,7 +159,7 @@ inline StatusCode content_get(TransactionHandle, StorageHandle storage, Slice ke
     auto& s = mock_db_state[*storage];
     auto it = s.find(key.to_string());
     if (it == s.end()) return StatusCode::NOT_FOUND;
-    static std::string last_val;
+    thread_local std::string last_val;
     last_val = it->second;
     *result = Slice(last_val.data(), last_val.size());
     return StatusCode::OK;
