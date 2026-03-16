@@ -23,6 +23,14 @@ enum class token_type {
     arrow_right, // ->
     arrow_left, // <-
     dash, // -
+    dot, // .
+    equals, // =
+    less_than, // <
+    greater_than, // >
+    keyword_as,
+    keyword_delete,
+    keyword_set,
+    keyword_unwind,
     eof,
     unknown
 };
@@ -72,6 +80,10 @@ private:
     std::shared_ptr<match_clause> parse_match();
     std::shared_ptr<return_clause> parse_return();
     std::shared_ptr<where_clause> parse_where();
+    std::shared_ptr<delete_clause> parse_delete();
+    std::shared_ptr<delete_clause> parse_delete_impl(bool detach);
+    std::shared_ptr<set_clause> parse_set();
+    std::shared_ptr<unwind_clause> parse_unwind();
 
     pattern_path parse_pattern_path();
     std::shared_ptr<pattern_node> parse_node_pattern();

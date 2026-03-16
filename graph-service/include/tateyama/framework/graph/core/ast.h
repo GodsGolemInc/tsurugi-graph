@@ -15,7 +15,10 @@ enum class node_type {
     variable,
     literal_string,
     literal_number,
-    property_access
+    property_access,
+    binary,
+    list_literal,
+    map_literal
 };
 
 struct expression {
@@ -44,9 +47,22 @@ struct property_access : public expression {
 };
 
 struct binary_expression : public expression {
-    // Simplified: left OP right
-    // For prototype, we might not implement full expression tree yet, 
-    // but keep structure ready.
+    std::shared_ptr<expression> left;
+    std::string op; // =, >, <, <>, >=, <=
+    std::shared_ptr<expression> right;
+    node_type type() const override { return node_type::binary; }
+    binary_expression(std::shared_ptr<expression> l, std::string o, std::shared_ptr<expression> r)
+        : left(std::move(l)), op(std::move(o)), right(std::move(r)) {}
+};
+
+struct list_literal_expr : public expression {
+    std::vector<std::shared_ptr<expression>> elements;
+    node_type type() const override { return node_type::list_literal; }
+};
+
+struct map_literal_expr : public expression {
+    std::map<std::string, std::shared_ptr<expression>> entries;
+    node_type type() const override { return node_type::map_literal; }
 };
 
 // --- Pattern Matching ---
@@ -79,7 +95,10 @@ enum class clause_type {
     create,
     match,
     return_clause,
-    where
+    where,
+    delete_clause,
+    set_clause,
+    unwind
 };
 
 struct clause {
@@ -108,12 +127,35 @@ struct return_clause : public clause {
 };
 
 struct where_clause : public clause {
-    // Simplified: property = value
+    std::shared_ptr<expression> condition; // binary_expression or property_access
+    // Legacy fields kept for backward compatibility
     std::string variable;
     std::string property;
     std::string op; // =, >, <
     std::shared_ptr<expression> value;
     clause_type type() const override { return clause_type::where; }
+};
+
+struct delete_clause : public clause {
+    std::vector<std::string> variables; // variable names to delete
+    bool detach = false; // DETACH DELETE
+    clause_type type() const override { return clause_type::delete_clause; }
+};
+
+struct set_clause : public clause {
+    struct assignment {
+        std::string variable;
+        std::string property;
+        std::shared_ptr<expression> value;
+    };
+    std::vector<assignment> assignments;
+    clause_type type() const override { return clause_type::set_clause; }
+};
+
+struct unwind_clause : public clause {
+    std::shared_ptr<expression> list_expr;
+    std::string alias;
+    clause_type type() const override { return clause_type::unwind; }
 };
 
 // --- Statement ---

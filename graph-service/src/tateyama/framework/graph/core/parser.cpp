@@ -14,7 +14,7 @@ std::vector<token> lexer::tokenize() {
         if (is_eof()) break;
 
         char c = peek();
-        if (isalpha(c)) {
+        if (isalpha(c) || c == '_') {
             tokens.push_back(scan_identifier_or_keyword());
         } else if (isdigit(c)) {
             tokens.push_back(scan_number());
@@ -48,39 +48,54 @@ void lexer::skip_whitespace() {
     }
 }
 
+// Case-insensitive string comparison without allocation
+static bool ci_eq(const char* s, size_t len, const char* keyword) {
+    for (size_t i = 0; i < len; ++i) {
+        if (static_cast<char>(toupper(static_cast<unsigned char>(s[i]))) != keyword[i]) return false;
+    }
+    return keyword[len] == '\0';
+}
+
 token lexer::scan_identifier_or_keyword() {
     size_t start = pos_;
     while (!is_eof() && (isalnum(peek()) || peek() == '_')) {
         advance();
     }
-    std::string text = input_.substr(start, pos_ - start);
+    size_t len = pos_ - start;
+    std::string text = input_.substr(start, len);
     token_type type = token_type::identifier;
-    
-    std::string upper_text = text;
-    std::transform(upper_text.begin(), upper_text.end(), upper_text.begin(), ::toupper);
 
-    if (upper_text == "CREATE") type = token_type::keyword_create;
-    else if (upper_text == "MATCH") type = token_type::keyword_match;
-    else if (upper_text == "RETURN") type = token_type::keyword_return;
-    else if (upper_text == "WHERE") type = token_type::keyword_where;
+    const char* s = input_.data() + start;
+    switch (len) {
+        case 2: if (ci_eq(s, len, "AS")) type = token_type::keyword_as; break;
+        case 3: if (ci_eq(s, len, "SET")) type = token_type::keyword_set; break;
+        case 5: if (ci_eq(s, len, "MATCH")) type = token_type::keyword_match;
+                else if (ci_eq(s, len, "WHERE")) type = token_type::keyword_where; break;
+        case 6: if (ci_eq(s, len, "CREATE")) type = token_type::keyword_create;
+                else if (ci_eq(s, len, "RETURN")) type = token_type::keyword_return;
+                else if (ci_eq(s, len, "DELETE")) type = token_type::keyword_delete;
+                else if (ci_eq(s, len, "DETACH")) type = token_type::keyword_delete;
+                else if (ci_eq(s, len, "UNWIND")) type = token_type::keyword_unwind; break;
+    }
 
-    return {type, text, start};
+    return {type, std::move(text), start};
 }
 
 token lexer::scan_string() {
     size_t start = pos_;
     char quote = advance();
     while (!is_eof() && peek() != quote) {
+        if (peek() == '\\') advance(); // skip escape char
         advance();
     }
     if (!is_eof()) advance(); // consume closing quote
-    // Include quotes in text for simplicity now, or strip them
-    return {token_type::string_literal, input_.substr(start, pos_ - start), start};
+    // Strip quotes directly without intermediate copy
+    return {token_type::string_literal, input_.substr(start + 1, pos_ - start - 2), start};
 }
 
 token lexer::scan_number() {
     size_t start = pos_;
-    while (!is_eof() && isdigit(peek())) {
+    while (!is_eof() && (isdigit(peek()) || peek() == '.')) {
         advance();
     }
     return {token_type::number_literal, input_.substr(start, pos_ - start), start};
@@ -98,19 +113,25 @@ token lexer::scan_symbol() {
         case ']': return {token_type::rbracket, "]", start};
         case ':': return {token_type::colon, ":", start};
         case ',': return {token_type::comma, ",", start};
-        case '-': 
-            if (peek() == '>') {
-                advance();
-                return {token_type::arrow_right, "->", start};
-            }
-            return {token_type::dash, "-", start};
+        case '.': return {token_type::dot, ".", start};
+        case '=': return {token_type::equals, "=", start};
+        case '>': return {token_type::greater_than, ">", start};
         case '<':
             if (peek() == '-') {
                 advance();
                 return {token_type::arrow_left, "<-", start};
             }
-            // default fallback?
-            break;
+            if (peek() == '>') {
+                advance();
+                return {token_type::greater_than, "<>", start}; // not-equal operator
+            }
+            return {token_type::less_than, "<", start};
+        case '-':
+            if (peek() == '>') {
+                advance();
+                return {token_type::arrow_right, "->", start};
+            }
+            return {token_type::dash, "-", start};
     }
     return {token_type::unknown, std::string(1, c), start};
 }
@@ -126,10 +147,17 @@ statement parser::parse() {
 }
 
 const token& parser::peek() const {
+    if (pos_ >= tokens_.size()) {
+        static const token eof_token{token_type::eof, "", 0};
+        return eof_token;
+    }
     return tokens_[pos_];
 }
 
 token parser::advance() {
+    if (pos_ >= tokens_.size()) {
+        return {token_type::eof, "", 0};
+    }
     return tokens_[pos_++];
 }
 
@@ -153,6 +181,19 @@ std::shared_ptr<clause> parser::parse_clause() {
     if (match(token_type::keyword_match)) return parse_match();
     if (match(token_type::keyword_return)) return parse_return();
     if (match(token_type::keyword_where)) return parse_where();
+    if (peek().type == token_type::keyword_delete) {
+        // Handle DETACH DELETE or DELETE
+        auto tok = advance();
+        std::string upper = tok.text;
+        std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+        bool detach = (upper == "DETACH");
+        if (detach) {
+            consume(token_type::keyword_delete, "Expected 'DELETE' after 'DETACH'");
+        }
+        return parse_delete_impl(detach);
+    }
+    if (match(token_type::keyword_set)) return parse_set();
+    if (match(token_type::keyword_unwind)) return parse_unwind();
     throw std::runtime_error("Unexpected token at start of clause: " + peek().text);
 }
 
@@ -177,7 +218,12 @@ std::shared_ptr<return_clause> parser::parse_return() {
     do {
         return_item item;
         item.expr = parse_expression();
-        // Optional alias 'AS' ... (skip for now)
+        // Handle AS alias
+        if (match(token_type::keyword_as)) {
+            if (peek().type == token_type::identifier) {
+                item.alias = advance().text;
+            }
+        }
         c->items.push_back(item);
     } while (match(token_type::comma));
     return c;
@@ -185,30 +231,70 @@ std::shared_ptr<return_clause> parser::parse_return() {
 
 std::shared_ptr<where_clause> parser::parse_where() {
     auto c = std::make_shared<where_clause>();
-    // Simplistic parsing: var.prop = val
-    auto expr = parse_expression();
-    if (auto prop_access = std::dynamic_pointer_cast<property_access>(expr)) {
-        c->variable = prop_access->variable_name;
-        c->property = prop_access->property_key;
-        
-        // Assume = for now
-        // TODO: parse operator
-        if (peek().text == "=") { // Should check token type properly if we had operator tokens
-             advance(); // consume =
-             c->op = "=";
-        } else {
-             // fallback for prototype
-             c->op = "=";
+    auto left = parse_expression();
+
+    // Check for comparison operator
+    if (peek().type == token_type::equals ||
+        peek().type == token_type::less_than ||
+        peek().type == token_type::greater_than) {
+        std::string op = advance().text;
+        auto right = parse_expression();
+        c->condition = std::make_shared<binary_expression>(left, op, right);
+
+        // Populate legacy fields for backward compatibility
+        if (auto prop_access = std::dynamic_pointer_cast<property_access>(left)) {
+            c->variable = prop_access->variable_name;
+            c->property = prop_access->property_key;
+            c->op = op;
+            c->value = right;
         }
-        
-        c->value = parse_expression();
+    } else {
+        c->condition = left;
     }
+
+    return c;
+}
+
+std::shared_ptr<delete_clause> parser::parse_delete() {
+    return parse_delete_impl(false);
+}
+
+std::shared_ptr<delete_clause> parser::parse_delete_impl(bool detach) {
+    auto c = std::make_shared<delete_clause>();
+    c->detach = detach;
+    do {
+        if (peek().type == token_type::identifier) {
+            c->variables.push_back(advance().text);
+        } else {
+            throw std::runtime_error("Expected variable name in DELETE clause");
+        }
+    } while (match(token_type::comma));
+    return c;
+}
+
+std::shared_ptr<set_clause> parser::parse_set() {
+    auto c = std::make_shared<set_clause>();
+    do {
+        set_clause::assignment asgn;
+        if (peek().type != token_type::identifier) {
+            throw std::runtime_error("Expected variable name in SET clause");
+        }
+        asgn.variable = advance().text;
+        consume(token_type::dot, "Expected '.' in SET clause");
+        if (peek().type != token_type::identifier) {
+            throw std::runtime_error("Expected property name in SET clause");
+        }
+        asgn.property = advance().text;
+        consume(token_type::equals, "Expected '=' in SET clause");
+        asgn.value = parse_expression();
+        c->assignments.push_back(asgn);
+    } while (match(token_type::comma));
     return c;
 }
 
 pattern_path parser::parse_pattern_path() {
     pattern_path path;
-    
+
     // First node
     pattern_element elem;
     elem.node = parse_node_pattern();
@@ -217,15 +303,10 @@ pattern_path parser::parse_pattern_path() {
     // Relationships
     while (true) {
         if (peek().type == token_type::dash || peek().type == token_type::arrow_left) {
-            // Found start of relationship: -[...]-> or <-[...]-, or just --
             auto rel = parse_relationship_pattern();
-            
-            // Next node
             auto next_node = parse_node_pattern();
-            
-            // Link previous element to relationship
             path.elements.back().relationship = rel;
-            
+
             pattern_element next_elem;
             next_elem.node = next_node;
             path.elements.push_back(next_elem);
@@ -239,21 +320,21 @@ pattern_path parser::parse_pattern_path() {
 std::shared_ptr<pattern_node> parser::parse_node_pattern() {
     consume(token_type::lparen, "Expected '(' for node");
     auto node = std::make_shared<pattern_node>();
-    
+
     if (peek().type == token_type::identifier) {
         node->variable = advance().text;
     }
-    
+
     if (match(token_type::colon)) {
         if (peek().type == token_type::identifier) {
             node->label = advance().text;
         }
     }
-    
+
     if (peek().type == token_type::lbrace) {
         node->properties = parse_properties_map();
     }
-    
+
     consume(token_type::rparen, "Expected ')' for node");
     return node;
 }
@@ -261,10 +342,9 @@ std::shared_ptr<pattern_node> parser::parse_node_pattern() {
 std::shared_ptr<pattern_relationship> parser::parse_relationship_pattern() {
     auto rel = std::make_shared<pattern_relationship>();
     bool left_arrow = match(token_type::arrow_left); // <-
-    bool has_dash = false;
-    
+
     if (!left_arrow) {
-        has_dash = match(token_type::dash); // -
+        match(token_type::dash); // -
     }
 
     if (match(token_type::lbracket)) {
@@ -281,7 +361,7 @@ std::shared_ptr<pattern_relationship> parser::parse_relationship_pattern() {
         }
         consume(token_type::rbracket, "Expected ']'");
     }
-    
+
     bool right_arrow = match(token_type::arrow_right); // ->
     if (!right_arrow) {
         match(token_type::dash); // -
@@ -308,22 +388,58 @@ std::map<std::string, std::shared_ptr<expression>> parser::parse_properties_map(
 }
 
 std::shared_ptr<expression> parser::parse_expression() {
-    // Very simplified
-    if (peek().type == token_type::identifier) {
-        std::string var = advance().text;
-        if (match(token_type::unknown) /* . */) { 
-            // NOTE: Lexer currently returns unknown for dot. 
-            // We should fix lexer for dot if we want strictness.
-            // For now assuming dot is unknown char or part of identifier if simplified.
-            // Let's assume we implement property access properly later.
+    // List literal: [expr, expr, ...]
+    if (peek().type == token_type::lbracket) {
+        advance(); // consume '['
+        auto list = std::make_shared<list_literal_expr>();
+        while (peek().type != token_type::rbracket && peek().type != token_type::eof) {
+            list->elements.push_back(parse_expression());
+            if (!match(token_type::comma)) break;
         }
-        return std::make_shared<variable>(var);
+        consume(token_type::rbracket, "Expected ']' in list literal");
+        return list;
+    }
+
+    // Map literal: {key: expr, ...}
+    if (peek().type == token_type::lbrace) {
+        advance(); // consume '{'
+        auto map = std::make_shared<map_literal_expr>();
+        while (peek().type != token_type::rbrace && peek().type != token_type::eof) {
+            std::string key = consume(token_type::identifier, "Expected key in map literal").text;
+            consume(token_type::colon, "Expected ':' in map literal");
+            map->entries[key] = parse_expression();
+            if (!match(token_type::comma)) break;
+        }
+        consume(token_type::rbrace, "Expected '}' in map literal");
+        return map;
+    }
+
+    if (peek().type == token_type::identifier) {
+        std::string name = advance().text;
+        // Check for property access: var.prop
+        if (peek().type == token_type::dot) {
+            advance(); // consume dot
+            if (peek().type == token_type::identifier) {
+                std::string prop = advance().text;
+                return std::make_shared<property_access>(name, prop);
+            }
+            throw std::runtime_error("Expected property name after '.'");
+        }
+        return std::make_shared<variable>(name);
     } else if (peek().type == token_type::string_literal) {
         return std::make_shared<literal>(advance().text, true);
     } else if (peek().type == token_type::number_literal) {
         return std::make_shared<literal>(advance().text, false);
     }
     throw std::runtime_error("Unexpected expression token: " + peek().text);
+}
+
+std::shared_ptr<unwind_clause> parser::parse_unwind() {
+    auto c = std::make_shared<unwind_clause>();
+    c->list_expr = parse_expression();
+    consume(token_type::keyword_as, "Expected AS in UNWIND clause");
+    c->alias = consume(token_type::identifier, "Expected alias in UNWIND clause").text;
+    return c;
 }
 
 } // namespace tateyama::framework::graph::core

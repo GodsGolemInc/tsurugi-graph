@@ -39,6 +39,11 @@ bool executor::execute(const statement& stmt, std::string& result_json) {
             case clause_type::set_clause:
                 if (!execute_set(std::dynamic_pointer_cast<set_clause>(clause))) return false;
                 break;
+            case clause_type::unwind: {
+                auto unwind = std::dynamic_pointer_cast<unwind_clause>(clause);
+                if (!execute_unwind(unwind, stmt, ci, result_json)) return false;
+                break;
+            }
         }
     }
     return true;
@@ -97,6 +102,23 @@ std::string executor::evaluate_properties(const std::map<std::string, std::share
         } else if (expr->type() == node_type::literal_number) {
             auto lit = std::dynamic_pointer_cast<literal>(expr);
             result += lit->value;
+        } else if (expr->type() == node_type::property_access) {
+            auto pa = std::dynamic_pointer_cast<property_access>(expr);
+            auto uit = unwind_context_.find(pa->variable_name);
+            if (uit != unwind_context_.end()) {
+                auto pit = uit->second.properties.find(pa->property_key);
+                if (pit != uit->second.properties.end()) {
+                    auto sit = uit->second.is_string.find(pa->property_key);
+                    bool is_str = (sit != uit->second.is_string.end() && sit->second);
+                    if (is_str) {
+                        result += '"';
+                        result += pit->second;
+                        result += '"';
+                    } else {
+                        result += pit->second;
+                    }
+                }
+            }
         }
     }
     result += '}';
@@ -528,6 +550,78 @@ bool executor::execute_set(const std::shared_ptr<set_clause>& set) {
             store_.update_node(tx_, id, updated);
         }
     }
+    return true;
+}
+
+bool executor::execute_unwind(const std::shared_ptr<unwind_clause>& unwind,
+                              const statement& stmt, size_t& ci, std::string& result_json) {
+    // Evaluate list expression
+    if (unwind->list_expr->type() != node_type::list_literal) {
+        return true; // Only list literals supported
+    }
+    auto list = std::dynamic_pointer_cast<list_literal_expr>(unwind->list_expr);
+    if (!list || list->elements.empty()) return true;
+
+    // Collect subsequent clause indices (everything after UNWIND)
+    size_t start_ci = ci + 1;
+    size_t end_ci = stmt.clauses.size();
+
+    // For each element in the list, bind alias and execute subsequent clauses
+    for (auto& item_expr : list->elements) {
+        // Build unwind binding from map literal
+        unwind_binding binding;
+        if (item_expr->type() == node_type::map_literal) {
+            auto map = std::dynamic_pointer_cast<map_literal_expr>(item_expr);
+            for (auto& [key, val_expr] : map->entries) {
+                if (auto lit = std::dynamic_pointer_cast<literal>(val_expr)) {
+                    binding.properties[key] = lit->value;
+                    binding.is_string[key] = lit->is_string;
+                }
+            }
+        } else if (auto lit = std::dynamic_pointer_cast<literal>(item_expr)) {
+            binding.properties["_value"] = lit->value;
+            binding.is_string["_value"] = lit->is_string;
+        }
+
+        unwind_context_[unwind->alias] = std::move(binding);
+
+        // Execute subsequent clauses with this binding
+        for (size_t sub_ci = start_ci; sub_ci < end_ci; ++sub_ci) {
+            const auto& clause = stmt.clauses[sub_ci];
+            switch (clause->type()) {
+                case clause_type::create:
+                    if (!execute_create(std::dynamic_pointer_cast<create_clause>(clause))) return false;
+                    break;
+                case clause_type::match:
+                    if (!execute_match(std::dynamic_pointer_cast<match_clause>(clause))) return false;
+                    break;
+                case clause_type::where:
+                    if (!execute_where(std::dynamic_pointer_cast<where_clause>(clause))) return false;
+                    break;
+                case clause_type::return_clause:
+                    if (!execute_return(std::dynamic_pointer_cast<return_clause>(clause), result_json)) return false;
+                    break;
+                case clause_type::delete_clause:
+                    if (!execute_delete(std::dynamic_pointer_cast<delete_clause>(clause))) return false;
+                    break;
+                case clause_type::set_clause:
+                    if (!execute_set(std::dynamic_pointer_cast<set_clause>(clause))) return false;
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        // Clear per-iteration node context (but keep unwind_context_ for next iteration)
+        context_.clear();
+        context_labels_.clear();
+    }
+
+    // Clean up unwind binding
+    unwind_context_.erase(unwind->alias);
+
+    // Skip all remaining clauses (UNWIND consumed them)
+    ci = end_ci - 1;
     return true;
 }
 
