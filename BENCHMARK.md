@@ -135,119 +135,126 @@
 
 ### Results Summary (100K nodes, ops/sec — higher is better)
 
-| Operation | tsurugi-graph (mock) | FalkorDB | Memgraph | Neo4j |
+| Operation | tsurugi-graph (mock) | Memgraph | FalkorDB | Neo4j |
 |:---|---:|---:|---:|---:|
-| **CREATE node** | **86,337** | 1,162 | 729 | 195 |
-| **MATCH indexed = (point read)** | **1,386** | 858 | 707 | 363 |
-| **MATCH WHERE > (full scan, 100q)** | 12 | **65** | 19 | 23 |
-| **CREATE edge (MATCH+CREATE)** | N/A† | **70** | 22 | 22 |
-| **1-hop traversal** | **114,515** | 667 | 720 | 370 |
-
-† tsurugi-graph edge creation benchmarked separately via raw storage API (326K ops/s)
+| **CREATE node (individual)** | **56,451** | 640 | 1,240 | 190 |
+| **UNWIND bulk insert (100/batch)** | **53,462** | 16,185 | 11,924 | 8,165 |
+| **MATCH indexed = (point read)** | **1,012** | 655 | 963 | 367 |
+| **MATCH WHERE > (full scan, 100q)** | 5 | 14 | **47** | 20 |
+| **CREATE edge (MATCH+CREATE)** | **21,465** | 15 | 47 | 18 |
+| **1-hop traversal** | **82,645** | 666 | 656 | 354 |
 
 ### Detailed Results
 
 #### 1. CREATE Node (100K individual CREATE statements)
 
-| Database | Ops | Time (sec) | Ops/sec | vs. best external |
+| Database | Ops | Time (sec) | Ops/sec |
+|:---|---:|---:|---:|
+| **tsurugi-graph (Cypher CREATE)** | 100,000 | 1.77 | 56,451 |
+| **tsurugi-graph (Storage API)** | 100,000 | 0.59 | 169,740 |
+| FalkorDB | 100,000 | 80.65 | 1,240 |
+| Memgraph | 100,000 | 156.36 | 640 |
+| Neo4j | 100,000 | 525.12 | 190 |
+
+#### 2. UNWIND Bulk Insert (100K nodes, 100 nodes per batch)
+
+| Database | Ops | Time (sec) | Ops/sec | vs. individual CREATE |
 |:---|---:|---:|---:|---:|
-| **tsurugi-graph (Cypher CREATE)** | 100,000 | 1.16 | 86,337 | 74x |
-| **tsurugi-graph (Storage API)** | 100,000 | 0.32 | 312,837 | 269x |
-| FalkorDB | 100,000 | 86.07 | 1,162 | 1.0x |
-| Memgraph | 100,000 | 137.20 | 729 | — |
-| Neo4j | 100,000 | 511.80 | 195 | — |
+| **tsurugi-graph** | 100,000 | 1.87 | 53,462 | 0.95x |
+| Memgraph | 100,000 | 6.18 | **16,185** | **25x** |
+| FalkorDB | 100,000 | 8.39 | 11,924 | **9.6x** |
+| Neo4j | 100,000 | 12.25 | 8,165 | **43x** |
 
 **Analysis:**
-- tsurugi-graph's Cypher CREATE (86K ops/s) is **74x faster** than the fastest external database (FalkorDB at 1.2K ops/s). The raw storage API is 269x faster.
-- The external databases include client-server protocol overhead (Bolt/Redis). tsurugi-graph runs in-process with zero I/O.
-- FalkorDB leads among real databases due to Redis's efficient command processing. Memgraph and Neo4j's Bolt protocol adds ~1ms latency per round-trip.
-- Production tsurugi-graph with Shirakami will be slower due to disk I/O, but should remain significantly faster than external DBs when accessed via Tateyama's in-process service API.
+- UNWIND batching dramatically improves external DB throughput by amortizing protocol overhead: Neo4j **43x**, Memgraph **25x**, FalkorDB **9.6x**.
+- tsurugi-graph's UNWIND is marginally slower than individual CREATE (0.95x) because UNWIND adds list/map literal parsing overhead. Since tsurugi runs in-process, there is no protocol round-trip to amortize.
+- With UNWIND, Memgraph (16K ops/s) closes the gap significantly with tsurugi (53K ops/s) — a 3.3x difference vs 88x with individual CREATE.
+- This demonstrates that the per-query protocol overhead was the dominant bottleneck for external databases, not the database engine itself.
 
-#### 2. Indexed Point Read (MATCH + indexed property equality, 10K queries)
+#### 3. Indexed Point Read (MATCH + indexed property equality, 10K queries)
 
 | Database | Ops | Time (sec) | Ops/sec | Latency/query |
 |:---|---:|---:|---:|---:|
-| **tsurugi-graph** | 100 | 0.07 | 1,386 | 0.72ms |
-| FalkorDB | 10,000 | 11.66 | 858 | 1.17ms |
-| Memgraph | 10,000 | 14.14 | 707 | 1.41ms |
-| Neo4j | 10,000 | 27.56 | 363 | 2.76ms |
+| **tsurugi-graph** | 100 | 0.10 | 1,012 | 0.99ms |
+| FalkorDB | 10,000 | 10.39 | 963 | 1.04ms |
+| Memgraph | 10,000 | 15.26 | 655 | 1.53ms |
+| Neo4j | 10,000 | 27.26 | 367 | 2.73ms |
 
 **Analysis:**
-- All databases achieve sub-3ms indexed lookups, demonstrating effective index utilization.
-- tsurugi-graph's 0.72ms includes Cypher parse + property index lookup + JSON formatting.
-- FalkorDB and Memgraph are competitive at ~1ms, consistent with their in-memory architectures.
-- Neo4j's 2.76ms reflects additional disk/cache layer overhead.
+- tsurugi-graph and FalkorDB are essentially tied at ~1ms per query. All databases achieve sub-3ms indexed lookups.
 
-#### 3. Full Scan WHERE (MATCH + inequality filter, 100 queries over 50K Person nodes)
+#### 4. Full Scan WHERE (MATCH + inequality filter, 100 queries over 50K Person nodes)
 
 | Database | Ops | Time (sec) | Ops/sec | Latency/query |
 |:---|---:|---:|---:|---:|
-| FalkorDB | 100 | 1.53 | **65** | 15.3ms |
-| Neo4j | 100 | 4.44 | 23 | 44.4ms |
-| Memgraph | 100 | 5.14 | 19 | 51.4ms |
-| tsurugi-graph | 100 | 8.17 | 12 | 81.7ms |
+| FalkorDB | 100 | 2.12 | **47** | 21.2ms |
+| Neo4j | 100 | 4.89 | 20 | 48.9ms |
+| Memgraph | 100 | 6.92 | 14 | 69.2ms |
+| tsurugi-graph | 100 | 18.33 | 5 | 183.3ms |
 
 **Analysis:**
-- FalkorDB excels at full scans due to GraphBLAS sparse matrix operations — 3x faster than Neo4j/Memgraph.
-- tsurugi-graph is slowest here because the mock backend's `std::map` iteration is less cache-friendly than purpose-built scan engines. Production Shirakami's sequential B+tree scan should improve this.
-- All databases show O(N) scaling for unindexed inequality queries.
+- FalkorDB excels at full scans due to GraphBLAS columnar property storage — packed integer arrays are cache-friendly and potentially SIMD-vectorized.
+- tsurugi-graph is slowest because: (1) `std::map` iterator pointer-chasing is cache-unfriendly, (2) each node's properties are stored as JSON strings requiring per-node parse, (3) no columnar property layout.
+- Production Shirakami's sequential B+tree scan will improve cache locality but cannot match columnar engines.
 
-#### 4. CREATE Edge (MATCH source + MATCH target + CREATE edge, 10K operations)
+#### 5. CREATE Edge (MATCH source + MATCH target + CREATE edge, 10K operations)
 
 | Database | Ops | Time (sec) | Ops/sec |
 |:---|---:|---:|---:|
-| FalkorDB | 10,000 | 142.07 | **70** |
-| Memgraph | 10,000 | 444.74 | 22 |
-| Neo4j | 10,000 | 446.04 | 22 |
+| **tsurugi-graph** | 10,000 | 0.47 | **21,465** |
+| FalkorDB | 10,000 | 211.89 | 47 |
+| Neo4j | 10,000 | 556.22 | 18 |
+| Memgraph | 10,000 | 649.73 | 15 |
 
 **Analysis:**
-- Edge creation via Cypher requires 2 indexed lookups + 1 write per operation, making it the most expensive workload.
-- FalkorDB's in-process Redis command pipeline gives it a 3x advantage over Bolt-based databases.
-- tsurugi-graph's raw storage `create_edge` runs at 326K ops/s (in-memory mock), but Cypher-level edge creation with MATCH is not yet benchmarked end-to-end.
+- tsurugi-graph is **457x faster** than FalkorDB for Cypher edge creation. This was enabled by the MATCH inline property index optimization (ADR-0006): `MATCH (n:Person {name: 'X'})` uses `find_nodes_by_property()` directly instead of scanning all label nodes.
+- External databases already optimize this internally but the Bolt/Redis protocol overhead (2 round-trips for 2 MATCHes + 1 for CREATE) dominates at 22-70ms total per edge.
 
-#### 5. 1-Hop Traversal (MATCH path with edge type, 1K queries)
+#### 6. 1-Hop Traversal (MATCH path with edge type, 1K queries)
 
 | Database | Ops | Time (sec) | Ops/sec | Latency/query |
 |:---|---:|---:|---:|---:|
-| **tsurugi-graph** | 100,000 | 0.87 | 114,515 | 0.009ms |
-| Memgraph | 1,000 | 1.39 | 720 | 1.39ms |
-| FalkorDB | 1,000 | 1.50 | 667 | 1.50ms |
-| Neo4j | 1,000 | 2.70 | 370 | 2.70ms |
+| **tsurugi-graph** | 100,000 | 1.21 | 82,645 | 0.012ms |
+| Memgraph | 1,000 | 1.50 | 666 | 1.50ms |
+| FalkorDB | 1,000 | 1.52 | 656 | 1.52ms |
+| Neo4j | 1,000 | 2.82 | 354 | 2.82ms |
 
 **Analysis:**
-- tsurugi-graph's raw edge traversal (outgoing edge list + get_edge) is **159x faster** than Memgraph. This reflects zero protocol overhead and O(1) adjacency list access in memory.
-- Among real databases, Memgraph and FalkorDB are essentially tied at ~1.4ms per hop. Neo4j is 2x slower at 2.7ms.
-- Production tsurugi-graph traversal with Shirakami should remain fast due to sequential key layout optimizing for adjacency list access.
+- tsurugi-graph's raw edge traversal is **124x faster** than Memgraph — zero protocol overhead and O(1) adjacency list access in memory.
+- Among real databases, Memgraph and FalkorDB are tied at ~1.5ms. Neo4j is 2x slower.
 
-### Performance Ratio Summary (relative to Neo4j)
+### Performance Ratio Summary (relative to Memgraph)
 
 | Operation | tsurugi (mock) | FalkorDB | Memgraph | Neo4j |
 |:---|---:|---:|---:|---:|
-| CREATE node | **443x** | 6.0x | 3.7x | 1.0x |
-| Indexed point read | **3.8x** | 2.4x | 1.9x | 1.0x |
-| Full scan WHERE | 0.5x | **2.8x** | 0.8x | 1.0x |
-| CREATE edge | N/A | **3.2x** | 1.0x | 1.0x |
-| 1-hop traversal | **310x** | 1.8x | 1.9x | 1.0x |
+| CREATE node (individual) | **88x** | 1.9x | 1.0x | 0.3x |
+| UNWIND bulk insert | **3.3x** | 0.7x | 1.0x | 0.5x |
+| Indexed point read | **1.5x** | 1.5x | 1.0x | 0.6x |
+| Full scan WHERE | 0.4x | **3.4x** | 1.0x | 1.4x |
+| CREATE edge | **1,431x** | 3.1x | 1.0x | 1.2x |
+| 1-hop traversal | **124x** | 1.0x | 1.0x | 0.5x |
 
 ### Caveats
 
-1. **Protocol overhead dominates**: External databases are accessed via network protocol (Bolt/Redis). tsurugi-graph runs in-process. A fairer comparison would use embedded mode or shared-memory IPC for all databases.
+1. **Protocol overhead vs in-process**: External databases are accessed via network protocol (Bolt/Redis). tsurugi-graph runs in-process. UNWIND batching shows that protocol overhead accounts for 10-40x of the individual CREATE difference.
 2. **Mock backend**: tsurugi-graph uses `std::map`-based mock storage. Production Shirakami will add I/O latency but provides ACID guarantees.
-3. **No batching**: All writes are single-statement (no UNWIND/batch). Memgraph and Neo4j can achieve much higher throughput with batch operations.
-4. **Single-threaded**: No concurrent clients. Production databases benefit from connection pooling and parallel execution.
+3. **Single-threaded**: No concurrent clients. Production databases benefit from connection pooling and parallel execution.
+4. **Full scan weakness**: tsurugi-graph's JSON-based property storage is structurally disadvantaged for full scans compared to columnar engines (FalkorDB/GraphBLAS).
 
 ### Summary: Competitive Positioning
 
 | Strength | tsurugi-graph | Neo4j | Memgraph | FalkorDB |
 |:---|:---|:---|:---|:---|
-| **Write throughput** | Very high (mock) | Slow | Moderate | Fast |
+| **Write (individual)** | Very high (mock) | Slow | Moderate | Fast |
+| **Write (UNWIND batch)** | High (mock) | Fast | Very fast | Fast |
 | **Indexed lookup** | Fast (mock) | Moderate | Fast | Fast |
 | **Full scan** | Slow (mock map) | Moderate | Moderate | Fast (GraphBLAS) |
+| **Edge creation** | Very fast (mock) | Slow | Slow | Moderate |
 | **Traversal** | Very fast (mock) | Slow | Fast | Fast |
 | **ACID transactions** | Yes (Shirakami) | Yes | Yes (snapshot) | Limited |
 | **Persistence** | Shirakami B+tree | Disk+RAM | In-memory+WAL | In-memory |
 | **Concurrency** | Untested | Battle-tested | High | High |
-| **Cypher coverage** | Basic subset | Full | Full (+ MAGE) | Subset |
+| **Cypher coverage** | Basic subset + UNWIND | Full | Full (+ MAGE) | Subset |
 | **Maturity** | Prototype | Production (15+ yrs) | Production | Production |
 
 ---
@@ -265,12 +272,17 @@
 - `std::stringstream` elimination, `memcmp` prefix comparison
 - Label caching, numeric pre-conversion, keyword matching by length
 
-### Round 4: Algorithmic optimizations (v2, current)
+### Round 4: Algorithmic optimizations (v2)
 - Property index (ADR-0002): O(N) → O(log N) for equality WHERE
 - Fused MATCH+WHERE: Skips label scan entirely for indexed queries
 - Query cache (ADR-0003): Reuses parsed ASTs
 - Batch reads (ADR-0004): Pre-fetches node properties
 - Parallel scan (ADR-0005): Multi-threaded full-scan WHERE
+
+### Round 5: UNWIND bulk insert + MATCH inline property index (current)
+- UNWIND clause (ADR-0006): Bulk insert via `UNWIND [...] AS item CREATE ...`
+- MATCH inline property index: `MATCH (n:Person {name: 'X'})` uses property index directly (191x speedup for Cypher edge creation)
+- WHERE batch prefetch: Pre-fetches all node properties via `get_nodes_batch()` before filtering loop
 
 ---
 
