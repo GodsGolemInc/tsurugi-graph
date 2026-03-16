@@ -3,6 +3,7 @@
 #include <cstring>
 #include <set>
 #include <thread>
+#include <unordered_map>
 
 namespace tateyama::framework::graph::core {
 
@@ -277,6 +278,39 @@ bool executor::execute_where(const std::shared_ptr<where_clause>& where) {
     auto& ids = it->second;
     std::vector<uint64_t> filtered;
 
+    // ADR-0004: Batch prefetch all node properties before filtering
+    std::vector<std::pair<uint64_t, std::string>> batch_results;
+    store_.get_nodes_batch(tx_, ids, batch_results);
+
+    // Build lookup map for O(1) access during filtering
+    std::unordered_map<uint64_t, std::string*> props_map;
+    props_map.reserve(batch_results.size());
+    for (auto& [id, props] : batch_results) {
+        props_map[id] = &props;
+    }
+
+    // Filter lambda (shared between parallel and sequential paths)
+    auto filter_node = [&](uint64_t id) -> bool {
+        auto pit = props_map.find(id);
+        if (pit == props_map.end()) return false;
+        std::string val = get_json_value(*pit->second, prop_key);
+        if (val.empty()) return false;
+
+        if (op == "=") return val == compare_value;
+        if (is_numeric) {
+            double node_val;
+            try { node_val = std::stod(val); } catch (...) { return false; }
+            if (op == ">") return node_val > compare_numeric;
+            if (op == "<") return node_val < compare_numeric;
+            if (op == "<>") return node_val != compare_numeric;
+        } else {
+            if (op == ">") return val > compare_value;
+            if (op == "<") return val < compare_value;
+            if (op == "<>") return val != compare_value;
+        }
+        return false;
+    };
+
     // ADR-0005: Parallel execution for large candidate sets
     if (ids.size() >= PARALLEL_THRESHOLD) {
         size_t num_threads = std::min(
@@ -296,27 +330,7 @@ bool executor::execute_where(const std::shared_ptr<where_clause>& where) {
             threads.emplace_back([&, begin, end, t]() {
                 auto& local = per_thread_results[t];
                 for (size_t i = begin; i < end; ++i) {
-                    std::string props;
-                    if (!store_.get_node(tx_, ids[i], props)) continue;
-                    std::string val = get_json_value(props, prop_key);
-                    if (val.empty()) continue;
-
-                    bool match_result = false;
-                    if (op == "=") {
-                        match_result = (val == compare_value);
-                    } else if (is_numeric) {
-                        double node_val;
-                        try { node_val = std::stod(val); } catch (...) { continue; }
-                        if (op == ">") match_result = node_val > compare_numeric;
-                        else if (op == "<") match_result = node_val < compare_numeric;
-                        else if (op == "<>") match_result = node_val != compare_numeric;
-                    } else {
-                        if (op == ">") match_result = val > compare_value;
-                        else if (op == "<") match_result = val < compare_value;
-                        else if (op == "<>") match_result = val != compare_value;
-                    }
-
-                    if (match_result) local.push_back(ids[i]);
+                    if (filter_node(ids[i])) local.push_back(ids[i]);
                 }
             });
         }
@@ -330,28 +344,7 @@ bool executor::execute_where(const std::shared_ptr<where_clause>& where) {
         // Single-threaded path for small candidate sets
         filtered.reserve(ids.size());
         for (uint64_t id : ids) {
-            std::string props;
-            if (!store_.get_node(tx_, id, props)) continue;
-
-            std::string val = get_json_value(props, prop_key);
-            if (val.empty()) continue;
-
-            bool match_result = false;
-            if (op == "=") {
-                match_result = (val == compare_value);
-            } else if (is_numeric) {
-                double node_val;
-                try { node_val = std::stod(val); } catch (...) { continue; }
-                if (op == ">") match_result = node_val > compare_numeric;
-                else if (op == "<") match_result = node_val < compare_numeric;
-                else if (op == "<>") match_result = node_val != compare_numeric;
-            } else {
-                if (op == ">") match_result = val > compare_value;
-                else if (op == "<") match_result = val < compare_value;
-                else if (op == "<>") match_result = val != compare_value;
-            }
-
-            if (match_result) {
+            if (filter_node(id)) {
                 filtered.push_back(id);
             }
         }
