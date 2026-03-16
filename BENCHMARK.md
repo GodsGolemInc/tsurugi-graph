@@ -124,88 +124,126 @@
 
 ---
 
-## Competitive Performance Comparison
+## Comparative Performance Benchmark (Same-Machine, 100K Nodes)
 
-> **Disclaimer:** The following comparisons use publicly available third-party benchmark data.
-> Direct comparison is inherently imperfect due to differing hardware, workloads, storage engines,
-> and concurrency models. tsurugi-graph numbers are **single-threaded, in-memory mock** measurements
-> that eliminate I/O latency. Production performance with Shirakami will be lower due to disk I/O
-> and transaction coordination overhead. These comparisons are intended to provide directional context,
-> not rigorous apples-to-apples evaluation.
+> **Test Environment:** All databases running on the same machine (Linux 6.17.0-14-generic, x86_64).
+> Single-threaded, sequential operations. Each database started fresh with empty data.
+> tsurugi-graph uses in-memory mock backend (no I/O). Neo4j, Memgraph, and FalkorDB are
+> real database server processes accessed via Bolt/Redis protocol from Python client.
 
-### Node Creation Throughput
+**Database versions:** Neo4j 5.26.2, Memgraph 2.20.0, FalkorDB 4.16.7, tsurugi-graph (mock)
 
-| Database | Throughput | Conditions | Source |
-|:---|---:|:---|:---|
-| **tsurugi-graph (Cypher CREATE)** | 76K–98K ops/s | Single-thread, in-memory mock, parse+execute | This benchmark |
-| **tsurugi-graph (Storage API)** | 226K–321K ops/s | Single-thread, in-memory mock, direct storage | This benchmark |
-| **Memgraph** | ~250K nodes/s | In-memory, `UNWIND+CREATE` batch, 100K nodes | [Memgraph Blog](https://memgraph.com/blog/memgraph-or-neo4j-analyzing-write-speed-performance) |
-| **Neo4j** | ~26K nodes/s | Disk+RAM, `UNWIND+CREATE` batch, 100K nodes (3.8s) | [Memgraph Blog](https://memgraph.com/blog/memgraph-or-neo4j-analyzing-write-speed-performance) |
-| **Neo4j (bulk import)** | >1M records/s | Offline `neo4j-admin import` tool (non-transactional) | [Neo4j Blog](https://neo4j.com/blog/news/neo4j-2-2-0-scalability-performance/) |
-| **RedisGraph/FalkorDB** | ~10K nodes/s | Single `CREATE` per command, 100K nodes | [Redis Blog](https://redis.io/blog/new-redisgraph-1-0-achieves-600x-faster-performance-graph-databases/) |
+### Results Summary (100K nodes, ops/sec — higher is better)
 
-**Analysis:**
-- tsurugi-graph's Cypher CREATE (76–98K ops/s) includes per-query parsing and property indexing overhead. Without parsing (raw storage API), throughput exceeds 300K ops/s.
-- Memgraph achieves similar throughput via `UNWIND` batch semantics (single parse, multiple writes). tsurugi-graph parses each query individually; adding batch `UNWIND` support would close this gap.
-- Neo4j's transactional CREATE is ~26K/s due to disk persistence. tsurugi-graph's mock eliminates I/O, so production performance with Shirakami will be lower but should remain competitive due to Shirakami's in-memory-first architecture.
+| Operation | tsurugi-graph (mock) | FalkorDB | Memgraph | Neo4j |
+|:---|---:|---:|---:|---:|
+| **CREATE node** | **86,337** | 1,162 | 729 | 195 |
+| **MATCH indexed = (point read)** | **1,386** | 858 | 707 | 363 |
+| **MATCH WHERE > (full scan, 100q)** | 12 | **65** | 19 | 23 |
+| **CREATE edge (MATCH+CREATE)** | N/A† | **70** | 22 | 22 |
+| **1-hop traversal** | **114,515** | 667 | 720 | 370 |
 
-### Point Read / Property Lookup Latency
+† tsurugi-graph edge creation benchmarked separately via raw storage API (326K ops/s)
 
-| Database | Latency | Conditions | Source |
-|:---|---:|:---|:---|
-| **tsurugi-graph (get_node)** | <1μs | In-memory mock, single key lookup | This benchmark |
-| **tsurugi-graph (indexed WHERE =)** | 0.6ms (100K) – 69ms (10M) | Parse + property index lookup + RETURN | This benchmark |
-| **Neo4j (indexed)** | <1ms | With range index, warm cache | [Neo4j Docs](https://neo4j.com/docs/cypher-manual/current/indexes/search-performance-indexes/using-indexes/) |
-| **Memgraph** | 1.07ms | Expansion-1 query, 12 concurrent clients | [Memgraph Blog](https://memgraph.com/blog/memgraph-vs-neo4j-performance-benchmark-comparison) |
-| **Neo4j** | 13.7ms – 27.96ms | Expansion-1 query, 12 concurrent clients | [Memgraph Blog](https://memgraph.com/blog/memgraph-vs-neo4j-performance-benchmark-comparison) |
-| **RedisGraph/FalkorDB** | <10ms (p99 <140ms) | Sub-10ms typical, in-memory GraphBLAS | [FalkorDB Blog](https://www.falkordb.com/blog/graph-database-performance-benchmarks-falkordb-vs-neo4j/) |
+### Detailed Results
+
+#### 1. CREATE Node (100K individual CREATE statements)
+
+| Database | Ops | Time (sec) | Ops/sec | vs. best external |
+|:---|---:|---:|---:|---:|
+| **tsurugi-graph (Cypher CREATE)** | 100,000 | 1.16 | 86,337 | 74x |
+| **tsurugi-graph (Storage API)** | 100,000 | 0.32 | 312,837 | 269x |
+| FalkorDB | 100,000 | 86.07 | 1,162 | 1.0x |
+| Memgraph | 100,000 | 137.20 | 729 | — |
+| Neo4j | 100,000 | 511.80 | 195 | — |
 
 **Analysis:**
-- tsurugi-graph's raw point read (~1μs) is a pure in-memory hash lookup. The indexed Cypher query (0.6ms at 100K) includes parse, index scan, and JSON result formatting.
-- At 10M nodes, tsurugi-graph's indexed WHERE takes 69ms per query. This degradation is primarily from `std::map` O(log N) in the mock; production Shirakami's B+tree will have similar asymptotic behavior with lower constants.
-- Neo4j and Memgraph both achieve sub-millisecond indexed lookups with warm caches, comparable to tsurugi-graph at smaller scales.
+- tsurugi-graph's Cypher CREATE (86K ops/s) is **74x faster** than the fastest external database (FalkorDB at 1.2K ops/s). The raw storage API is 269x faster.
+- The external databases include client-server protocol overhead (Bolt/Redis). tsurugi-graph runs in-process with zero I/O.
+- FalkorDB leads among real databases due to Redis's efficient command processing. Memgraph and Neo4j's Bolt protocol adds ~1ms latency per round-trip.
+- Production tsurugi-graph with Shirakami will be slower due to disk I/O, but should remain significantly faster than external DBs when accessed via Tateyama's in-process service API.
 
-### Graph Traversal (1-hop)
+#### 2. Indexed Point Read (MATCH + indexed property equality, 10K queries)
 
-| Database | Latency | Dataset | Source |
-|:---|---:|:---|:---|
-| **tsurugi-graph** | ~8μs/hop | 100K nodes, 5 edges/node, single-thread | This benchmark |
-| **RedisGraph** | 0.39ms | graph500 (2.4M nodes, 64M edges), single-thread | [Redis Blog](https://redis.io/blog/new-redisgraph-1-0-achieves-600x-faster-performance-graph-databases/) |
-| **Neo4j** | 21ms | graph500, single-thread | [Redis Blog](https://redis.io/blog/new-redisgraph-1-0-achieves-600x-faster-performance-graph-databases/) |
-| **Memgraph** | ~1ms | Expansion-1, 12 clients | [Memgraph Blog](https://memgraph.com/blog/memgraph-vs-neo4j-performance-benchmark-comparison) |
+| Database | Ops | Time (sec) | Ops/sec | Latency/query |
+|:---|---:|---:|---:|---:|
+| **tsurugi-graph** | 100 | 0.07 | 1,386 | 0.72ms |
+| FalkorDB | 10,000 | 11.66 | 858 | 1.17ms |
+| Memgraph | 10,000 | 14.14 | 707 | 1.41ms |
+| Neo4j | 10,000 | 27.56 | 363 | 2.76ms |
 
 **Analysis:**
-- tsurugi-graph achieves ~8μs per edge traversal (outgoing edges lookup + get_edge) in mock. This is faster than published numbers from other databases, but the mock eliminates all I/O and lock overhead.
-- RedisGraph/FalkorDB's 0.39ms on a much larger dataset (64M edges) demonstrates strong single-thread performance from GraphBLAS sparse matrix operations.
-- Production tsurugi-graph with Shirakami will add I/O overhead, likely placing performance in the 0.1–1ms range per hop, competitive with RedisGraph and Memgraph.
+- All databases achieve sub-3ms indexed lookups, demonstrating effective index utilization.
+- tsurugi-graph's 0.72ms includes Cypher parse + property index lookup + JSON formatting.
+- FalkorDB and Memgraph are competitive at ~1ms, consistent with their in-memory architectures.
+- Neo4j's 2.76ms reflects additional disk/cache layer overhead.
 
-### Concurrent Throughput (QPS)
+#### 3. Full Scan WHERE (MATCH + inequality filter, 100 queries over 50K Person nodes)
 
-| Database | QPS | Workload | Source |
-|:---|---:|:---|:---|
-| **Memgraph** | 32,028 | Expansion-1, 12 clients | [Memgraph Blog](https://memgraph.com/blog/memgraph-vs-neo4j-performance-benchmark-comparison) |
-| **Neo4j** | 280 | Expansion-1, 12 clients | [Memgraph Blog](https://memgraph.com/blog/memgraph-vs-neo4j-performance-benchmark-comparison) |
-| **FalkorDB** | Sub-10ms per query | p99 < 140ms, in-memory | [FalkorDB Blog](https://www.falkordb.com/blog/graph-database-performance-benchmarks-falkordb-vs-neo4j/) |
-| **tsurugi-graph** | N/A (single-thread) | Not yet benchmarked with concurrent clients | — |
+| Database | Ops | Time (sec) | Ops/sec | Latency/query |
+|:---|---:|---:|---:|---:|
+| FalkorDB | 100 | 1.53 | **65** | 15.3ms |
+| Neo4j | 100 | 4.44 | 23 | 44.4ms |
+| Memgraph | 100 | 5.14 | 19 | 51.4ms |
+| tsurugi-graph | 100 | 8.17 | 12 | 81.7ms |
 
-**Note:** tsurugi-graph's service layer supports concurrent requests via Tateyama's threading model, but concurrent QPS has not been benchmarked yet. The parallel WHERE optimization (ADR-0005) provides intra-query parallelism, not inter-query concurrency.
+**Analysis:**
+- FalkorDB excels at full scans due to GraphBLAS sparse matrix operations — 3x faster than Neo4j/Memgraph.
+- tsurugi-graph is slowest here because the mock backend's `std::map` iteration is less cache-friendly than purpose-built scan engines. Production Shirakami's sequential B+tree scan should improve this.
+- All databases show O(N) scaling for unindexed inequality queries.
 
-### Full Scan Query (MATCH+WHERE without index)
+#### 4. CREATE Edge (MATCH source + MATCH target + CREATE edge, 10K operations)
 
-| Database | Latency (1M nodes) | Conditions | Source |
-|:---|---:|:---|:---|
-| **tsurugi-graph** | 944ms/query | Full scan, inequality WHERE, in-memory mock | This benchmark |
-| **Neo4j** | 3,100ms | Most complex query, warm cache | [Memgraph Blog](https://memgraph.com/blog/memgraph-vs-neo4j-performance-benchmark-comparison) |
-| **Memgraph** | ~1,000ms | Most complex query (Q11 Expansion-4) | [Memgraph Blog](https://memgraph.com/blog/memgraph-vs-neo4j-performance-benchmark-comparison) |
+| Database | Ops | Time (sec) | Ops/sec |
+|:---|---:|---:|---:|
+| FalkorDB | 10,000 | 142.07 | **70** |
+| Memgraph | 10,000 | 444.74 | 22 |
+| Neo4j | 10,000 | 446.04 | 22 |
+
+**Analysis:**
+- Edge creation via Cypher requires 2 indexed lookups + 1 write per operation, making it the most expensive workload.
+- FalkorDB's in-process Redis command pipeline gives it a 3x advantage over Bolt-based databases.
+- tsurugi-graph's raw storage `create_edge` runs at 326K ops/s (in-memory mock), but Cypher-level edge creation with MATCH is not yet benchmarked end-to-end.
+
+#### 5. 1-Hop Traversal (MATCH path with edge type, 1K queries)
+
+| Database | Ops | Time (sec) | Ops/sec | Latency/query |
+|:---|---:|---:|---:|---:|
+| **tsurugi-graph** | 100,000 | 0.87 | 114,515 | 0.009ms |
+| Memgraph | 1,000 | 1.39 | 720 | 1.39ms |
+| FalkorDB | 1,000 | 1.50 | 667 | 1.50ms |
+| Neo4j | 1,000 | 2.70 | 370 | 2.70ms |
+
+**Analysis:**
+- tsurugi-graph's raw edge traversal (outgoing edge list + get_edge) is **159x faster** than Memgraph. This reflects zero protocol overhead and O(1) adjacency list access in memory.
+- Among real databases, Memgraph and FalkorDB are essentially tied at ~1.4ms per hop. Neo4j is 2x slower at 2.7ms.
+- Production tsurugi-graph traversal with Shirakami should remain fast due to sequential key layout optimizing for adjacency list access.
+
+### Performance Ratio Summary (relative to Neo4j)
+
+| Operation | tsurugi (mock) | FalkorDB | Memgraph | Neo4j |
+|:---|---:|---:|---:|---:|
+| CREATE node | **443x** | 6.0x | 3.7x | 1.0x |
+| Indexed point read | **3.8x** | 2.4x | 1.9x | 1.0x |
+| Full scan WHERE | 0.5x | **2.8x** | 0.8x | 1.0x |
+| CREATE edge | N/A | **3.2x** | 1.0x | 1.0x |
+| 1-hop traversal | **310x** | 1.8x | 1.9x | 1.0x |
+
+### Caveats
+
+1. **Protocol overhead dominates**: External databases are accessed via network protocol (Bolt/Redis). tsurugi-graph runs in-process. A fairer comparison would use embedded mode or shared-memory IPC for all databases.
+2. **Mock backend**: tsurugi-graph uses `std::map`-based mock storage. Production Shirakami will add I/O latency but provides ACID guarantees.
+3. **No batching**: All writes are single-statement (no UNWIND/batch). Memgraph and Neo4j can achieve much higher throughput with batch operations.
+4. **Single-threaded**: No concurrent clients. Production databases benefit from connection pooling and parallel execution.
 
 ### Summary: Competitive Positioning
 
 | Strength | tsurugi-graph | Neo4j | Memgraph | FalkorDB |
 |:---|:---|:---|:---|:---|
-| **Write throughput** | Very high (mock) | Moderate | Very high | Moderate |
-| **Indexed lookup** | Sub-ms (mock) | Sub-ms | ~1ms | Sub-10ms |
-| **Traversal** | Very fast (mock) | Moderate | Fast | Very fast |
-| **Full scan** | Fast (parallel) | Slow | Fast | Fast |
+| **Write throughput** | Very high (mock) | Slow | Moderate | Fast |
+| **Indexed lookup** | Fast (mock) | Moderate | Fast | Fast |
+| **Full scan** | Slow (mock map) | Moderate | Moderate | Fast (GraphBLAS) |
+| **Traversal** | Very fast (mock) | Slow | Fast | Fast |
 | **ACID transactions** | Yes (Shirakami) | Yes | Yes (snapshot) | Limited |
 | **Persistence** | Shirakami B+tree | Disk+RAM | In-memory+WAL | In-memory |
 | **Concurrency** | Untested | Battle-tested | High | High |
@@ -264,6 +302,8 @@
 
 ## How to Run Benchmarks
 
+### tsurugi-graph standalone benchmark
+
 ```bash
 cd tsurugi-graph/graph-service
 
@@ -281,4 +321,20 @@ g++ -std=c++17 -O2 \
 ./load_test 100000    # 100K nodes
 ./load_test 1000000   # 1M nodes
 ./load_test 10000000  # 10M nodes
+```
+
+### Comparative benchmark (all databases)
+
+Requires: Neo4j, Memgraph, FalkorDB installed in `bench/tools/`. Python packages: `neo4j`, `falkordb`.
+
+```bash
+cd tsurugi-graph/graph-service
+
+# Run all databases (100K nodes)
+python3 bench/comparative_bench.py 100000
+
+# Skip specific databases
+python3 bench/comparative_bench.py 100000 --skip-neo4j --skip-memgraph
+
+# Results saved to bench/tools/bench_data/results_<N>.json
 ```
