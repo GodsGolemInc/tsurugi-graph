@@ -7,14 +7,25 @@
 namespace tateyama::framework::graph::core {
 
 bool executor::execute(const statement& stmt, std::string& result_json) {
-    for (const auto& clause : stmt.clauses) {
+    for (size_t ci = 0; ci < stmt.clauses.size(); ++ci) {
+        const auto& clause = stmt.clauses[ci];
         switch (clause->type()) {
             case clause_type::create:
                 if (!execute_create(std::dynamic_pointer_cast<create_clause>(clause))) return false;
                 break;
-            case clause_type::match:
-                if (!execute_match(std::dynamic_pointer_cast<match_clause>(clause))) return false;
+            case clause_type::match: {
+                auto match = std::dynamic_pointer_cast<match_clause>(clause);
+                // Lookahead: fuse MATCH+WHERE when property index can be used
+                if (ci + 1 < stmt.clauses.size() && stmt.clauses[ci + 1]->type() == clause_type::where) {
+                    auto where = std::dynamic_pointer_cast<where_clause>(stmt.clauses[ci + 1]);
+                    if (try_indexed_match_where(match, where)) {
+                        ++ci; // Skip WHERE clause (already handled)
+                        break;
+                    }
+                }
+                if (!execute_match(match)) return false;
                 break;
+            }
             case clause_type::where:
                 if (!execute_where(std::dynamic_pointer_cast<where_clause>(clause))) return false;
                 break;
@@ -30,6 +41,40 @@ bool executor::execute(const statement& stmt, std::string& result_json) {
         }
     }
     return true;
+}
+
+bool executor::try_indexed_match_where(const std::shared_ptr<match_clause>& match, const std::shared_ptr<where_clause>& where) {
+    // Only optimize simple single-node MATCH patterns
+    if (match->paths.size() != 1 || match->paths[0].elements.size() != 1) return false;
+
+    auto& node = match->paths[0].elements[0].node;
+    if (node->label.empty() || node->variable.empty()) return false;
+
+    // Only optimize equality WHERE on this variable
+    if (where->variable != node->variable || where->op != "=") return false;
+    if (where->property.empty()) return false;
+
+    // Extract comparison value
+    std::string compare_value;
+    if (where->value) {
+        if (auto lit = std::dynamic_pointer_cast<literal>(where->value)) {
+            compare_value = lit->value;
+        } else {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    // Use property index directly (skips label scan entirely)
+    std::vector<uint64_t> results;
+    if (!store_.find_nodes_by_property(tx_, node->label, where->property, compare_value, results)) {
+        return false; // Index lookup failed, fall back to normal path
+    }
+
+    context_[node->variable] = std::move(results);
+    context_labels_[node->variable] = node->label;
+    return true; // Successfully handled both MATCH and WHERE
 }
 
 std::string executor::evaluate_properties(const std::map<std::string, std::shared_ptr<expression>>& props) {

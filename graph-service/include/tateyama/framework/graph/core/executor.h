@@ -34,6 +34,9 @@ private:
     bool execute_delete(const std::shared_ptr<delete_clause>& del);
     bool execute_set(const std::shared_ptr<set_clause>& set);
 
+    // Fused MATCH+WHERE using property index (skips label scan)
+    bool try_indexed_match_where(const std::shared_ptr<match_clause>& match, const std::shared_ptr<where_clause>& where);
+
     std::string evaluate_properties(const std::map<std::string, std::shared_ptr<expression>>& props);
 
     // JSON property helpers
