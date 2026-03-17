@@ -54,6 +54,7 @@ private:
     static constexpr int INITIAL_BACKOFF_MS = 10;
 
     static bool is_retryable(sharksfin::StatusCode code);
+    sharksfin::TransactionOptions make_ltx_options() const;
 
     // Query cache (ADR-0003)
     core::query_cache query_cache_;

@@ -13,9 +13,9 @@ enum class StatusCode : std::int64_t {
     OK = 0,
     NOT_FOUND = 1,
     ALREADY_EXISTS = 2,
-    ERR_SERIALIZATION_FAILURE = 10,
-    ERR_CONFLICT_ON_WRITE_PRESERVE = 11,
-    ERR_WAITING_FOR_OTHER_TRANSACTION = 12,
+    WAITING_FOR_OTHER_TRANSACTION = 4,
+    ERR_ABORTED_RETRYABLE = -8,
+    ERR_CONFLICT_ON_WRITE_PRESERVE = -12,
     ERR_UNKNOWN = 99
 };
 
@@ -23,6 +23,14 @@ enum class PutOperation {
     CREATE = 0,
     CREATE_OR_UPDATE = 1,
     UPDATE = 2
+};
+
+enum class EndPointKind : std::uint32_t {
+    UNBOUND = 0,
+    INCLUSIVE = 1,
+    EXCLUSIVE = 2,
+    PREFIXED_INCLUSIVE = 3,
+    PREFIXED_EXCLUSIVE = 4
 };
 
 struct Slice {
@@ -38,10 +46,13 @@ struct Slice {
 };
 
 using DatabaseHandle = void*;
+using TransactionControlHandle = void*;
 using TransactionHandle = void*;
 using StorageHandle = std::string*; // Mock storage handle as its name
 using IteratorHandle = void*;
-using SequenceHandle = std::string*;
+using SequenceId = std::size_t;
+using SequenceValue = std::int64_t;
+using SequenceVersion = std::size_t;
 
 struct StorageOptions {};
 struct TransactionOptions {
@@ -50,50 +61,65 @@ struct TransactionOptions {
 
 // Mock Global State
 inline std::map<std::string, std::map<std::string, std::string>> mock_db_state;
+inline std::map<SequenceId, SequenceValue> mock_sequence_values;
+inline std::map<SequenceId, SequenceVersion> mock_sequence_versions;
+inline SequenceId mock_next_sequence_id = 0;
+
+// Legacy sequence state for backward compat with tests that use these
 inline std::map<std::string, uint64_t> mock_sequences;
 
-inline StatusCode sequence_create(DatabaseHandle, Slice key, SequenceHandle* result) {
-    std::string name = key.to_string();
-    if (mock_sequences.count(name)) return StatusCode::ALREADY_EXISTS;
-    mock_sequences[name] = 1;
-    *result = new std::string(name);
+inline StatusCode sequence_create(DatabaseHandle, SequenceId* result) {
+    *result = mock_next_sequence_id++;
+    mock_sequence_values[*result] = 0;
+    mock_sequence_versions[*result] = 0;
     return StatusCode::OK;
 }
 
-inline StatusCode sequence_get(DatabaseHandle, Slice key, SequenceHandle* result) {
-    std::string name = key.to_string();
-    if (!mock_sequences.count(name)) return StatusCode::NOT_FOUND;
-    *result = new std::string(name);
+inline StatusCode sequence_put(TransactionHandle, SequenceId id, SequenceVersion version, SequenceValue value) {
+    mock_sequence_values[id] = value;
+    mock_sequence_versions[id] = version;
     return StatusCode::OK;
 }
 
-inline StatusCode sequence_next(TransactionHandle, SequenceHandle h, uint64_t* result) {
-    *result = mock_sequences[*h]++;
+inline StatusCode sequence_get(DatabaseHandle, SequenceId id, SequenceVersion* version, SequenceValue* value) {
+    auto it = mock_sequence_values.find(id);
+    if (it == mock_sequence_values.end()) return StatusCode::NOT_FOUND;
+    *value = it->second;
+    *version = mock_sequence_versions[id];
     return StatusCode::OK;
 }
+
 inline std::map<void*, std::map<std::string, std::string>::iterator> mock_iterators;
 inline std::map<void*, std::map<std::string, std::string>::iterator> mock_iterators_end;
 inline std::map<void*, bool> mock_iterators_started;
 
 inline int mock_commit_failure_count = 0;
 
-inline StatusCode transaction_begin(DatabaseHandle, TransactionOptions const&, TransactionHandle* result) {
+inline StatusCode transaction_begin(DatabaseHandle, TransactionOptions const&, TransactionControlHandle* result) {
     *result = (void*)0xbeef;
     return StatusCode::OK;
 }
 
-inline StatusCode transaction_commit(TransactionHandle) {
+inline StatusCode transaction_borrow_handle(TransactionControlHandle, TransactionHandle* result) {
+    *result = (void*)0xdead;
+    return StatusCode::OK;
+}
+
+inline StatusCode transaction_commit(TransactionControlHandle, bool /*async*/ = false) {
     if (mock_commit_failure_count > 0) {
         mock_commit_failure_count--;
-        return StatusCode::ERR_SERIALIZATION_FAILURE;
+        return StatusCode::ERR_ABORTED_RETRYABLE;
     }
     return StatusCode::OK;
 }
 
-inline StatusCode transaction_abort(TransactionHandle) { return StatusCode::OK; }
-inline StatusCode transaction_dispose(TransactionHandle) { return StatusCode::OK; }
+inline StatusCode transaction_abort(TransactionControlHandle, bool /*rollback*/ = false) { return StatusCode::OK; }
+inline StatusCode transaction_dispose(TransactionControlHandle) { return StatusCode::OK; }
 
-inline StatusCode content_scan(TransactionHandle, StorageHandle storage, Slice begin_key, int, Slice end_key, int, IteratorHandle* result) {
+inline StatusCode content_scan(TransactionHandle, StorageHandle storage,
+    Slice begin_key, EndPointKind /*begin_kind*/,
+    Slice /*end_key*/, EndPointKind /*end_kind*/,
+    IteratorHandle* result) {
     auto& s = mock_db_state[*storage];
     auto it = s.lower_bound(begin_key.to_string());
     static int iter_id = 0;
@@ -126,13 +152,22 @@ inline StatusCode iterator_get_key(IteratorHandle h, Slice* result) {
     return StatusCode::OK;
 }
 
+inline StatusCode iterator_get_value(IteratorHandle h, Slice* result) {
+    auto it = mock_iterators[h];
+    if (it == mock_iterators_end[h]) return StatusCode::NOT_FOUND;
+    thread_local std::string v;
+    v = it->second;
+    *result = Slice(v.data(), v.size());
+    return StatusCode::OK;
+}
+
 inline StatusCode iterator_dispose(IteratorHandle h) {
     mock_iterators.erase(h);
     mock_iterators_end.erase(h);
     return StatusCode::OK;
 }
 
-inline StatusCode storage_create(TransactionHandle, Slice key, StorageOptions const&, StorageHandle* result) {
+inline StatusCode storage_create(DatabaseHandle, Slice key, StorageOptions const&, StorageHandle* result) {
     std::string name = key.to_string();
     if (mock_db_state.find(name) != mock_db_state.end()) {
         *result = new std::string(name);
@@ -143,7 +178,7 @@ inline StatusCode storage_create(TransactionHandle, Slice key, StorageOptions co
     return StatusCode::OK;
 }
 
-inline StatusCode storage_get(TransactionHandle, Slice key, StorageHandle* result) {
+inline StatusCode storage_get(DatabaseHandle, Slice key, StorageHandle* result) {
     std::string name = key.to_string();
     if (mock_db_state.find(name) == mock_db_state.end()) return StatusCode::NOT_FOUND;
     *result = new std::string(name);

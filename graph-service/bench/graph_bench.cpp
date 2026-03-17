@@ -8,7 +8,7 @@
 #include <tateyama/framework/graph/core/parser.h>
 #include <tateyama/framework/graph/core/executor.h>
 #include <tateyama/framework/graph/storage.h>
-#include "sharksfin_mock.h" // We can use mock for logic bench or real if linked
+#include "../test/tateyama/framework/graph/sharksfin_mock.h"
 
 using namespace tateyama::framework::graph;
 using namespace tateyama::framework::graph::core;

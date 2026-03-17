@@ -23,7 +23,6 @@ public:
     static constexpr std::string_view STORAGE_NAME_IN_INDEX = "graph_in_index";
     static constexpr std::string_view STORAGE_NAME_LABEL_INDEX = "graph_label_index";
     static constexpr std::string_view STORAGE_NAME_PROPERTY_INDEX = "graph_prop_index";
-    static constexpr std::string_view SEQUENCE_NAME = "graph_id_sequence";
 
     storage() = default;
     ~storage() = default;
@@ -53,19 +52,37 @@ public:
     // Property index operations (ADR-0002)
     bool index_node_properties(sharksfin::TransactionHandle tx, uint64_t node_id, std::string_view label, std::string_view properties);
     bool find_nodes_by_property(sharksfin::TransactionHandle tx, std::string_view label, std::string_view prop_key, std::string_view prop_value, std::vector<uint64_t>& out_node_ids);
+    bool find_nodes_by_property_range(sharksfin::TransactionHandle tx, std::string_view label, std::string_view prop_key, const std::string& op, const std::string& compare_value, std::vector<uint64_t>& out_node_ids);
     bool remove_property_index(sharksfin::TransactionHandle tx, uint64_t node_id, std::string_view label, std::string_view properties);
 
     // Batch operations (ADR-0004)
     bool get_nodes_batch(sharksfin::TransactionHandle tx, const std::vector<uint64_t>& node_ids, std::vector<std::pair<uint64_t, std::string>>& out_results);
 
+    // Storage handle accessors for write-preserve configuration
+    sharksfin::StorageHandle nodes_storage() const { return nodes_handle_; }
+    sharksfin::StorageHandle edges_storage() const { return edges_handle_; }
+    sharksfin::StorageHandle out_index_storage() const { return out_index_handle_; }
+    sharksfin::StorageHandle in_index_storage() const { return in_index_handle_; }
+    sharksfin::StorageHandle label_index_storage() const { return label_index_handle_; }
+    sharksfin::StorageHandle property_index_storage() const { return property_index_handle_; }
+
 private:
+    static constexpr uint64_t SEQUENCE_BATCH_SIZE = 64;
+
+    // Allocate next unique ID, batching sequence_put calls
+    uint64_t allocate_id(sharksfin::TransactionHandle tx);
+
+    sharksfin::DatabaseHandle db_handle_{};
     sharksfin::StorageHandle nodes_handle_{};
     sharksfin::StorageHandle edges_handle_{};
     sharksfin::StorageHandle out_index_handle_{};
     sharksfin::StorageHandle in_index_handle_{};
     sharksfin::StorageHandle label_index_handle_{};
     sharksfin::StorageHandle property_index_handle_{};
-    sharksfin::SequenceHandle sequence_handle_{};
+    sharksfin::SequenceId sequence_id_{};
+    sharksfin::SequenceVersion sequence_version_{0};
+    uint64_t next_id_{1};
+    uint64_t sequence_batch_remaining_{0};
 };
 
 } // namespace tateyama::framework::graph

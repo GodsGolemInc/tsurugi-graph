@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 #include <tateyama/framework/repository.h>
 #include <tateyama/framework/transactional_kvs_resource.h>
+#include <sharksfin/api.h>
 
 namespace tateyama::framework::graph {
 
@@ -18,20 +19,53 @@ bool resource::start(framework::environment& env) {
         return false;
     }
 
-    auto db_handle = kvs_resource->core_object();
-    // In real implementation, we need a transaction to init storages or use a background one.
-    // For now, assume storage::init can work if given a handle if the implementation allows.
-    // However, sharksfin::storage_create requires a TransactionHandle or DatabaseHandle.
-    // Let's assume we can use a temporary transaction if needed.
-    
-    // For prototype, we skip init with a real transaction here or assume it's done lazily.
-    // But we need to at least keep the db_handle.
-    
-    LOG(INFO) << "Graph resource started";
+    db_handle_ = kvs_resource->core_object();
+    if (!db_handle_) {
+        LOG(ERROR) << "Database handle is null";
+        return false;
+    }
+
+    // Initialize graph storages using a dedicated transaction
+    sharksfin::TransactionOptions tx_opt{};
+    sharksfin::TransactionControlHandle tx_ctl{};
+    auto rc = sharksfin::transaction_begin(db_handle_, tx_opt, &tx_ctl);
+    if (rc != sharksfin::StatusCode::OK) {
+        LOG(ERROR) << "Failed to begin initialization transaction";
+        return false;
+    }
+
+    // Get data-path handle from control handle
+    sharksfin::TransactionHandle tx{};
+    rc = sharksfin::transaction_borrow_handle(tx_ctl, &tx);
+    if (rc != sharksfin::StatusCode::OK) {
+        LOG(ERROR) << "Failed to borrow transaction handle";
+        sharksfin::transaction_abort(tx_ctl);
+        sharksfin::transaction_dispose(tx_ctl);
+        return false;
+    }
+
+    if (!storage_->init(db_handle_, tx)) {
+        LOG(ERROR) << "Failed to initialize graph storages";
+        sharksfin::transaction_abort(tx_ctl);
+        sharksfin::transaction_dispose(tx_ctl);
+        return false;
+    }
+
+    rc = sharksfin::transaction_commit(tx_ctl);
+    sharksfin::transaction_dispose(tx_ctl);
+
+    if (rc != sharksfin::StatusCode::OK) {
+        LOG(ERROR) << "Failed to commit initialization transaction";
+        return false;
+    }
+
+    initialized_ = true;
+    LOG(INFO) << "Graph resource started - storages initialized";
     return true;
 }
 
 bool resource::shutdown(framework::environment&) {
+    initialized_ = false;
     LOG(INFO) << "Graph resource shutting down";
     return true;
 }

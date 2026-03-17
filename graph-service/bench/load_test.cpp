@@ -24,6 +24,9 @@ struct bench_result {
 static void reset_mock() {
     sharksfin::mock_db_state.clear();
     sharksfin::mock_sequences.clear();
+    sharksfin::mock_sequence_values.clear();
+    sharksfin::mock_sequence_versions.clear();
+    sharksfin::mock_next_sequence_id = 0;
     sharksfin::mock_iterators.clear();
     sharksfin::mock_iterators_end.clear();
     sharksfin::mock_iterators_started.clear();

@@ -14,6 +14,17 @@ message Request {
 message CypherRequest {
     string query = 1;
     map<string, string> parameters = 2;
+    TransactionOptions transaction_options = 3;
+}
+
+message TransactionOptions {
+    enum Type {
+        OCC = 0;
+        LTX = 1;
+        READ_ONLY = 2;
+    }
+    Type type = 1;
+    repeated string write_preserves = 2; // Storage names to preserve for LTX
 }
 
 message NodeGetRequest {

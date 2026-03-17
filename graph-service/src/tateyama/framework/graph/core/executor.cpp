@@ -180,39 +180,47 @@ bool executor::execute_match(const std::shared_ptr<match_clause>& match) {
         if (!first_node->label.empty()) {
             bool used_index = false;
 
-            // Optimization: use property index for inline property match (e.g., MATCH (n:Person {name: 'Alice'}))
+            // Optimization: use property index intersection for inline property match
+            // e.g., MATCH (n:Person {name: 'Alice', age: 30}) → intersect index results
             if (!first_node->properties.empty()) {
-                // Try each property for index lookup (first string literal wins)
+                bool first_prop = true;
+                std::vector<uint64_t> intersection;
+                bool all_indexed = true;
+
                 for (auto& [key, expr] : first_node->properties) {
-                    if (auto lit = std::dynamic_pointer_cast<literal>(expr)) {
-                        std::vector<uint64_t> index_ids;
-                        if (store_.find_nodes_by_property(tx_, first_node->label, key, lit->value, index_ids)) {
-                            // Filter by remaining properties if any
-                            if (first_node->properties.size() > 1) {
-                                std::vector<uint64_t> filtered;
-                                for (uint64_t id : index_ids) {
-                                    std::string props;
-                                    if (!store_.get_node(tx_, id, props)) continue;
-                                    bool all_match = true;
-                                    for (auto& [k2, e2] : first_node->properties) {
-                                        if (k2 == key) continue;
-                                        if (auto lit2 = std::dynamic_pointer_cast<literal>(e2)) {
-                                            std::string val = get_json_value(props, k2);
-                                            if (val != lit2->value) { all_match = false; break; }
-                                        }
-                                    }
-                                    if (all_match) filtered.push_back(id);
-                                }
-                                index_ids = std::move(filtered);
-                            }
-                            if (!first_node->variable.empty()) {
-                                context_[first_node->variable] = std::move(index_ids);
-                                context_labels_[first_node->variable] = first_node->label;
-                            }
-                            used_index = true;
-                            break;
-                        }
+                    auto lit = std::dynamic_pointer_cast<literal>(expr);
+                    if (!lit) { all_indexed = false; break; }
+
+                    // For numeric literals, convert to string (index stores string representation)
+                    std::string lookup_value = lit->value;
+
+                    std::vector<uint64_t> index_ids;
+                    if (!store_.find_nodes_by_property(tx_, first_node->label, key, lookup_value, index_ids)) {
+                        all_indexed = false;
+                        break;
                     }
+
+                    if (first_prop) {
+                        intersection = std::move(index_ids);
+                        std::sort(intersection.begin(), intersection.end());
+                        first_prop = false;
+                    } else {
+                        std::sort(index_ids.begin(), index_ids.end());
+                        std::vector<uint64_t> tmp;
+                        tmp.reserve(std::min(intersection.size(), index_ids.size()));
+                        std::set_intersection(intersection.begin(), intersection.end(),
+                                              index_ids.begin(), index_ids.end(),
+                                              std::back_inserter(tmp));
+                        intersection = std::move(tmp);
+                    }
+                }
+
+                if (all_indexed && !first_prop) {
+                    if (!first_node->variable.empty()) {
+                        context_[first_node->variable] = std::move(intersection);
+                        context_labels_[first_node->variable] = first_node->label;
+                    }
+                    used_index = true;
                 }
             }
 
@@ -353,7 +361,25 @@ bool executor::execute_where(const std::shared_ptr<where_clause>& where) {
         }
     }
 
-    // Full scan path (for inequality operators or when no label/index available)
+    // ADR-0010: Use range property index for inequality operators
+    if (op != "=" && op != "<>") {
+        auto label_it = context_labels_.find(where->variable);
+        if (label_it != context_labels_.end() && !label_it->second.empty()) {
+            std::vector<uint64_t> range_results;
+            if (store_.find_nodes_by_property_range(tx_, label_it->second, prop_key, op, compare_value, range_results)) {
+                std::set<uint64_t> range_set(range_results.begin(), range_results.end());
+                std::vector<uint64_t> filtered;
+                filtered.reserve(std::min(it->second.size(), range_results.size()));
+                for (uint64_t id : it->second) {
+                    if (range_set.count(id)) filtered.push_back(id);
+                }
+                it->second = std::move(filtered);
+                return true;
+            }
+        }
+    }
+
+    // Full scan path (for <> operator or when no label/index available)
     auto& ids = it->second;
     std::vector<uint64_t> filtered;
 
@@ -588,6 +614,10 @@ bool executor::execute_delete(const std::shared_ptr<delete_clause>& del) {
 }
 
 bool executor::execute_set(const std::shared_ptr<set_clause>& set) {
+    // Phase 1: Accumulate all SET assignments per node (deferred index update)
+    // node_id → (label, current_properties)
+    std::unordered_map<uint64_t, std::pair<std::string, std::string>> pending;
+
     for (const auto& asgn : set->assignments) {
         auto it = context_.find(asgn.variable);
         if (it == context_.end()) continue;
@@ -599,12 +629,28 @@ bool executor::execute_set(const std::shared_ptr<set_clause>& set) {
             is_string = lit->is_string;
         }
 
-        for (uint64_t id : it->second) {
-            std::string props;
-            if (!store_.get_node(tx_, id, props)) continue;
+        std::string label;
+        auto label_it = context_labels_.find(asgn.variable);
+        if (label_it != context_labels_.end()) label = label_it->second;
 
-            std::string updated = update_json_property(props, asgn.property, new_value, is_string);
-            store_.update_node(tx_, id, updated);
+        for (uint64_t id : it->second) {
+            auto& [lbl, props] = pending[id];
+            if (props.empty()) {
+                // First SET for this node — fetch current properties
+                store_.get_node(tx_, id, props);
+                lbl = label;
+            }
+            props = update_json_property(props, asgn.property, new_value, is_string);
+        }
+    }
+
+    // Phase 2: Apply final state with single index update per node
+    for (auto& [id, update] : pending) {
+        auto& [label, props] = update;
+        if (!label.empty()) {
+            store_.update_node_with_label(tx_, id, label, props);
+        } else {
+            store_.update_node(tx_, id, props);
         }
     }
     return true;

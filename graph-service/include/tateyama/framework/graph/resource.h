@@ -7,6 +7,7 @@
 #include <tateyama/framework/component_ids.h>
 #include <tateyama/framework/environment.h>
 #include <tateyama/framework/resource.h>
+#include <sharksfin/api.h>
 
 #include <tateyama/framework/graph/storage.h>
 
@@ -39,10 +40,16 @@ public:
         return *storage_;
     }
 
+    [[nodiscard]] sharksfin::DatabaseHandle db_handle() const noexcept {
+        return db_handle_;
+    }
+
     ~resource() override = default;
 
 private:
     std::unique_ptr<class storage> storage_{};
+    sharksfin::DatabaseHandle db_handle_{};
+    bool initialized_ = false;
 };
 
 } // namespace tateyama::framework::graph
