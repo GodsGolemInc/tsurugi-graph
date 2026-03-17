@@ -117,15 +117,33 @@ inline StatusCode transaction_abort(TransactionControlHandle, bool /*rollback*/ 
 inline StatusCode transaction_dispose(TransactionControlHandle) { return StatusCode::OK; }
 
 inline StatusCode content_scan(TransactionHandle, StorageHandle storage,
-    Slice begin_key, EndPointKind /*begin_kind*/,
-    Slice /*end_key*/, EndPointKind /*end_kind*/,
+    Slice begin_key, EndPointKind begin_kind,
+    Slice end_key, EndPointKind end_kind,
     IteratorHandle* result) {
     auto& s = mock_db_state[*storage];
-    auto it = s.lower_bound(begin_key.to_string());
+    std::string bk = begin_key.to_string();
+
+    // Position begin iterator
+    auto it = s.lower_bound(bk);
+    if (begin_kind == EndPointKind::EXCLUSIVE && it != s.end() && it->first == bk) {
+        ++it;
+    }
+
+    // Compute end boundary
+    auto end_it = s.end();
+    if (end_kind == EndPointKind::EXCLUSIVE) {
+        std::string ek = end_key.to_string();
+        end_it = s.lower_bound(ek);
+    } else if (end_kind == EndPointKind::INCLUSIVE) {
+        std::string ek = end_key.to_string();
+        end_it = s.upper_bound(ek);
+    }
+    // PREFIXED_INCLUSIVE/PREFIXED_EXCLUSIVE/UNBOUND: end_it stays at s.end()
+
     static int iter_id = 0;
     void* h = (void*)(uintptr_t)(++iter_id);
     mock_iterators[h] = it;
-    mock_iterators_end[h] = s.end();
+    mock_iterators_end[h] = end_it;
     mock_iterators_started[h] = false;
     *result = h;
     return StatusCode::OK;

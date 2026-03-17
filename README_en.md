@@ -115,12 +115,12 @@ Clients connect via the Tateyama protocol (IPC/TCP), sending Cypher queries to s
 
 ## Tests
 
-17 test files with 148 test cases, all using the mock Shirakami backend. 100% pass rate.
+17 test files with 153 test cases, all using the mock Shirakami backend. 100% pass rate.
 
 | Component | Test Files | Cases |
 |:--|:--|---:|
 | Parser | parser_standalone, parser_full, parser_edge, parser_property, parser_coverage | 40 |
-| Storage | storage_standalone, storage_label, storage_navigation, storage_property, storage_iterator, storage_coverage | 36 |
+| Storage | storage_standalone, storage_label, storage_navigation, storage_property, storage_iterator, storage_coverage | 41 |
 | Executor | executor, executor_advanced, executor_batch, executor_coverage | 36 |
 | Query Cache | query_cache | 35 |
 | Match Label | match_label | 1 |
@@ -164,6 +164,7 @@ See [BENCHMARK.md](BENCHMARK.md) for full results.
 | 0010 | Range Property Index | Inequality WHERE in O(V) |
 | 0011 | Query Template Cache | Literal normalization for higher hit rate |
 | 0012 | Streaming Executor | Peak memory 5GB → 100MB |
+| 0013 | Sortable Numeric Key | Range scan optimization, IEEE 754 binary encoding |
 
 ## Directory Structure
 

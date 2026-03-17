@@ -244,6 +244,138 @@ void test_update_node_with_label_empty_prior() {
     std::cout << "test_update_node_with_label_empty_prior: PASS" << std::endl;
 }
 
+// ADR-0013: Test sortable numeric key encoding with range scans
+void test_numeric_range_scan_gt() {
+    reset_mock();
+    auto s = create_storage();
+    TransactionHandle tx = (void*)0x2;
+
+    // Create nodes with various numeric values including negatives
+    for (int i = -5; i <= 5; ++i) {
+        uint64_t id;
+        std::string props = "{\"val\": " + std::to_string(i) + "}";
+        s.create_node(tx, "N", props, id);
+    }
+
+    std::vector<uint64_t> results;
+    s.find_nodes_by_property_range(tx, "N", "val", ">", "2", results);
+    // Should match val=3,4,5 (3 nodes)
+    assert(results.size() == 3);
+
+    // Test > with negative threshold
+    results.clear();
+    s.find_nodes_by_property_range(tx, "N", "val", ">", "-3", results);
+    // Should match -2,-1,0,1,2,3,4,5 (8 nodes)
+    assert(results.size() == 8);
+
+    std::cout << "test_numeric_range_scan_gt: PASS" << std::endl;
+}
+
+void test_numeric_range_scan_lt() {
+    reset_mock();
+    auto s = create_storage();
+    TransactionHandle tx = (void*)0x2;
+
+    for (int i = -5; i <= 5; ++i) {
+        uint64_t id;
+        std::string props = "{\"val\": " + std::to_string(i) + "}";
+        s.create_node(tx, "N", props, id);
+    }
+
+    std::vector<uint64_t> results;
+    s.find_nodes_by_property_range(tx, "N", "val", "<", "0", results);
+    // Should match -5,-4,-3,-2,-1 (5 nodes)
+    assert(results.size() == 5);
+
+    std::cout << "test_numeric_range_scan_lt: PASS" << std::endl;
+}
+
+void test_numeric_range_scan_boundary() {
+    reset_mock();
+    auto s = create_storage();
+    TransactionHandle tx = (void*)0x2;
+
+    for (int i = 0; i < 10; ++i) {
+        uint64_t id;
+        std::string props = "{\"val\": " + std::to_string(i * 10) + "}";
+        s.create_node(tx, "N", props, id);
+    }
+
+    // >= 50 should match 50,60,70,80,90 (5 nodes)
+    std::vector<uint64_t> results;
+    s.find_nodes_by_property_range(tx, "N", "val", ">=", "50", results);
+    assert(results.size() == 5);
+
+    // <= 20 should match 0,10,20 (3 nodes)
+    results.clear();
+    s.find_nodes_by_property_range(tx, "N", "val", "<=", "20", results);
+    assert(results.size() == 3);
+
+    // > 90 should match nothing
+    results.clear();
+    s.find_nodes_by_property_range(tx, "N", "val", ">", "90", results);
+    assert(results.size() == 0);
+
+    // < 0 should match nothing
+    results.clear();
+    s.find_nodes_by_property_range(tx, "N", "val", "<", "0", results);
+    assert(results.size() == 0);
+
+    std::cout << "test_numeric_range_scan_boundary: PASS" << std::endl;
+}
+
+void test_numeric_equality_with_encoding() {
+    reset_mock();
+    auto s = create_storage();
+    TransactionHandle tx = (void*)0x2;
+
+    uint64_t id1, id2;
+    s.create_node(tx, "N", "{\"val\": 42}", id1);
+    s.create_node(tx, "N", "{\"val\": 99}", id2);
+
+    // Equality lookup should work with new sortable encoding
+    std::vector<uint64_t> results;
+    s.find_nodes_by_property(tx, "N", "val", "42", results);
+    assert(results.size() >= 1);
+    assert(results[0] == id1);
+
+    results.clear();
+    s.find_nodes_by_property(tx, "N", "val", "99", results);
+    assert(results.size() >= 1);
+    assert(results[0] == id2);
+
+    // Non-existent value
+    results.clear();
+    s.find_nodes_by_property(tx, "N", "val", "100", results);
+    assert(results.size() == 0);
+
+    std::cout << "test_numeric_equality_with_encoding: PASS" << std::endl;
+}
+
+void test_mixed_numeric_string_properties() {
+    reset_mock();
+    auto s = create_storage();
+    TransactionHandle tx = (void*)0x2;
+
+    uint64_t id;
+    // Node with both numeric and string properties
+    s.create_node(tx, "N", "{\"age\": 30, \"name\": \"Alice\"}", id);
+    s.create_node(tx, "N", "{\"age\": 25, \"name\": \"Bob\"}", id);
+    s.create_node(tx, "N", "{\"age\": 35, \"name\": \"Charlie\"}", id);
+
+    // Numeric range query
+    std::vector<uint64_t> results;
+    s.find_nodes_by_property_range(tx, "N", "age", ">", "28", results);
+    assert(results.size() == 2);  // age=30 and age=35
+
+    // String range query
+    results.clear();
+    s.find_nodes_by_property_range(tx, "N", "name", ">", "Bob", results);
+    assert(results.size() == 1);  // "Charlie"
+
+    std::cout << "test_mixed_numeric_string_properties: PASS" << std::endl;
+}
+
 int main() {
     test_init_null_handle();
     test_delete_node_label_cleanup();
@@ -255,6 +387,11 @@ int main() {
     test_property_range_neq();
     test_property_range_string();
     test_update_node_with_label_empty_prior();
+    test_numeric_range_scan_gt();
+    test_numeric_range_scan_lt();
+    test_numeric_range_scan_boundary();
+    test_numeric_equality_with_encoding();
+    test_mixed_numeric_string_properties();
 
     std::cout << "\nAll storage coverage tests passed!" << std::endl;
     return 0;
