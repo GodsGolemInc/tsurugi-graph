@@ -225,29 +225,32 @@ bool executor::execute_match(const std::shared_ptr<match_clause>& match) {
             }
 
             if (!used_index) {
+                // ADR-0012: Use streaming iterator to avoid materializing all IDs
+                // in the KVS layer simultaneously
+                auto iter = store_.find_nodes_by_label_iter(tx_, first_node->label);
                 std::vector<uint64_t> ids;
-                if (store_.find_nodes_by_label(tx_, first_node->label, ids)) {
-                    // Filter by inline properties if present
-                    if (!first_node->properties.empty()) {
-                        std::vector<uint64_t> filtered;
-                        for (uint64_t id : ids) {
-                            std::string props;
-                            if (!store_.get_node(tx_, id, props)) continue;
-                            bool all_match = true;
-                            for (auto& [key, expr] : first_node->properties) {
-                                if (auto lit = std::dynamic_pointer_cast<literal>(expr)) {
-                                    std::string val = get_json_value(props, key);
-                                    if (val != lit->value) { all_match = false; break; }
-                                }
+                if (!first_node->properties.empty()) {
+                    // Filter by inline properties during iteration
+                    while (iter.next()) {
+                        std::string props;
+                        if (!iter.get_properties(props)) continue;
+                        bool all_match = true;
+                        for (auto& [key, expr] : first_node->properties) {
+                            if (auto lit = std::dynamic_pointer_cast<literal>(expr)) {
+                                std::string val = get_json_value(props, key);
+                                if (val != lit->value) { all_match = false; break; }
                             }
-                            if (all_match) filtered.push_back(id);
                         }
-                        ids = std::move(filtered);
+                        if (all_match) ids.push_back(iter.node_id());
                     }
-                    if (!first_node->variable.empty()) {
-                        context_[first_node->variable] = std::move(ids);
-                        context_labels_[first_node->variable] = first_node->label;
+                } else {
+                    while (iter.next()) {
+                        ids.push_back(iter.node_id());
                     }
+                }
+                if (!first_node->variable.empty() && !ids.empty()) {
+                    context_[first_node->variable] = std::move(ids);
+                    context_labels_[first_node->variable] = first_node->label;
                 }
             }
         }
@@ -380,22 +383,12 @@ bool executor::execute_where(const std::shared_ptr<where_clause>& where) {
     }
 
     // Full scan path (for <> operator or when no label/index available)
+    // ADR-0012: Process in BATCH_SIZE chunks to cap peak memory
     auto& ids = it->second;
     std::vector<uint64_t> filtered;
 
-    // ADR-0004: Batch prefetch all node properties before filtering
-    std::vector<std::pair<uint64_t, std::string>> batch_results;
-    store_.get_nodes_batch(tx_, ids, batch_results);
-
-    // Build lookup map for O(1) access during filtering
-    std::unordered_map<uint64_t, std::string*> props_map;
-    props_map.reserve(batch_results.size());
-    for (auto& [id, props] : batch_results) {
-        props_map[id] = &props;
-    }
-
-    // Filter lambda (shared between parallel and sequential paths)
-    auto filter_node = [&](uint64_t id) -> bool {
+    // Filter lambda — operates on a batch-local props_map
+    auto filter_node = [&](uint64_t id, const std::unordered_map<uint64_t, std::string*>& props_map) -> bool {
         auto pit = props_map.find(id);
         if (pit == props_map.end()) return false;
         std::string val = get_json_value(*pit->second, prop_key);
@@ -416,43 +409,55 @@ bool executor::execute_where(const std::shared_ptr<where_clause>& where) {
         return false;
     };
 
-    // ADR-0005: Parallel execution for large candidate sets
-    if (ids.size() >= PARALLEL_THRESHOLD) {
-        size_t num_threads = std::min(
-            static_cast<size_t>(std::thread::hardware_concurrency()),
-            ids.size() / 1000);
-        num_threads = std::max(num_threads, static_cast<size_t>(2));
+    for (size_t batch_off = 0; batch_off < ids.size(); batch_off += BATCH_SIZE) {
+        size_t batch_end = std::min(batch_off + BATCH_SIZE, ids.size());
 
-        std::vector<std::vector<uint64_t>> per_thread_results(num_threads);
-        std::vector<std::thread> threads;
-        size_t chunk = (ids.size() + num_threads - 1) / num_threads;
+        // Load properties for this chunk only
+        std::vector<uint64_t> chunk_ids(ids.begin() + batch_off, ids.begin() + batch_end);
+        std::vector<std::pair<uint64_t, std::string>> batch_results;
+        store_.get_nodes_batch(tx_, chunk_ids, batch_results);
 
-        for (size_t t = 0; t < num_threads; ++t) {
-            size_t begin = t * chunk;
-            size_t end = std::min(begin + chunk, ids.size());
-            if (begin >= ids.size()) break;
+        std::unordered_map<uint64_t, std::string*> props_map;
+        props_map.reserve(batch_results.size());
+        for (auto& [id, props] : batch_results) {
+            props_map[id] = &props;
+        }
 
-            threads.emplace_back([&, begin, end, t]() {
-                auto& local = per_thread_results[t];
-                for (size_t i = begin; i < end; ++i) {
-                    if (filter_node(ids[i])) local.push_back(ids[i]);
+        // ADR-0005: Parallel execution for large chunks
+        if (chunk_ids.size() >= PARALLEL_THRESHOLD) {
+            size_t num_threads = std::min(
+                static_cast<size_t>(std::thread::hardware_concurrency()),
+                chunk_ids.size() / 1000);
+            num_threads = std::max(num_threads, static_cast<size_t>(2));
+
+            std::vector<std::vector<uint64_t>> per_thread_results(num_threads);
+            std::vector<std::thread> threads;
+            size_t chunk_sz = (chunk_ids.size() + num_threads - 1) / num_threads;
+
+            for (size_t t = 0; t < num_threads; ++t) {
+                size_t begin = t * chunk_sz;
+                size_t end = std::min(begin + chunk_sz, chunk_ids.size());
+                if (begin >= chunk_ids.size()) break;
+
+                threads.emplace_back([&, begin, end, t]() {
+                    auto& local = per_thread_results[t];
+                    for (size_t i = begin; i < end; ++i) {
+                        if (filter_node(chunk_ids[i], props_map)) local.push_back(chunk_ids[i]);
+                    }
+                });
+            }
+            for (auto& th : threads) th.join();
+            for (auto& r : per_thread_results) {
+                filtered.insert(filtered.end(), r.begin(), r.end());
+            }
+        } else {
+            for (uint64_t id : chunk_ids) {
+                if (filter_node(id, props_map)) {
+                    filtered.push_back(id);
                 }
-            });
-        }
-
-        for (auto& th : threads) th.join();
-
-        for (auto& r : per_thread_results) {
-            filtered.insert(filtered.end(), r.begin(), r.end());
-        }
-    } else {
-        // Single-threaded path for small candidate sets
-        filtered.reserve(ids.size());
-        for (uint64_t id : ids) {
-            if (filter_node(id)) {
-                filtered.push_back(id);
             }
         }
+        // batch_results goes out of scope — memory freed
     }
 
     it->second = std::move(filtered);
@@ -480,96 +485,109 @@ bool executor::execute_return(const std::shared_ptr<return_clause>& ret, std::st
         }
     }
 
-    // ADR-0004: Batch-read all node properties upfront
-    std::map<std::string, std::map<uint64_t, std::string>> var_props_cache;
-    for (const auto& var_name : needed_vars) {
-        auto it = context_.find(var_name);
-        if (it == context_.end()) continue;
-        std::vector<std::pair<uint64_t, std::string>> batch;
-        store_.get_nodes_batch(tx_, it->second, batch);
-        auto& cache = var_props_cache[var_name];
-        for (auto& [id, props] : batch) {
-            cache[id] = std::move(props);
-        }
-    }
-
-    // Pre-allocate output
+    // ADR-0012: Batch-read node properties in chunks to cap peak memory
     result_json.clear();
-    result_json.reserve(max_rows * ret->items.size() * 64);
+    result_json.reserve(std::min(max_rows, BATCH_SIZE) * ret->items.size() * 64);
     result_json += '[';
 
-    for (size_t row = 0; row < max_rows; ++row) {
-        if (row > 0) result_json += ", ";
-        result_json += '{';
-        bool first = true;
-        for (const auto& item : ret->items) {
-            if (!first) result_json += ", ";
-            first = false;
+    for (size_t batch_start = 0; batch_start < max_rows; batch_start += BATCH_SIZE) {
+        size_t batch_end = std::min(batch_start + BATCH_SIZE, max_rows);
 
-            if (item.expr->type() == node_type::variable) {
-                auto var = std::dynamic_pointer_cast<variable>(item.expr);
-                const std::string& alias = item.alias.empty() ? var->name : item.alias;
-                result_json += '"';
-                result_json += alias;
-                result_json += "\": ";
+        // Load properties only for this batch's rows
+        std::map<std::string, std::unordered_map<uint64_t, std::string>> batch_cache;
+        for (const auto& var_name : needed_vars) {
+            auto ctx_it = context_.find(var_name);
+            if (ctx_it == context_.end()) continue;
+            std::vector<uint64_t> batch_ids;
+            for (size_t r = batch_start; r < batch_end && r < ctx_it->second.size(); ++r) {
+                batch_ids.push_back(ctx_it->second[r]);
+            }
+            if (batch_ids.empty()) continue;
+            std::vector<std::pair<uint64_t, std::string>> batch_results;
+            store_.get_nodes_batch(tx_, batch_ids, batch_results);
+            auto& cache = batch_cache[var_name];
+            cache.reserve(batch_results.size());
+            for (auto& [id, props] : batch_results) {
+                cache[id] = std::move(props);
+            }
+        }
 
-                auto it = context_.find(var->name);
-                if (it != context_.end() && row < it->second.size()) {
-                    uint64_t id = it->second[row];
-                    auto& cache = var_props_cache[var->name];
-                    auto cache_it = cache.find(id);
-                    if (cache_it != cache.end() && !cache_it->second.empty()) {
-                        result_json += cache_it->second;
-                    } else {
-                        edge_data ed;
-                        if (store_.get_edge(tx_, id, ed)) {
-                            result_json += "{\"_id\": ";
-                            result_json += std::to_string(id);
-                            result_json += ", \"_from\": ";
-                            result_json += std::to_string(ed.from_id);
-                            result_json += ", \"_to\": ";
-                            result_json += std::to_string(ed.to_id);
-                            result_json += ", \"_label\": \"";
-                            result_json += ed.label;
-                            result_json += '"';
-                            if (!ed.properties.empty() && ed.properties != "{}") {
-                                result_json += ", \"_properties\": ";
-                                result_json += ed.properties;
-                            }
-                            result_json += '}';
+        // Emit rows for this batch
+        for (size_t row = batch_start; row < batch_end; ++row) {
+            if (row > 0) result_json += ", ";
+            result_json += '{';
+            bool first = true;
+            for (const auto& item : ret->items) {
+                if (!first) result_json += ", ";
+                first = false;
+
+                if (item.expr->type() == node_type::variable) {
+                    auto var = std::dynamic_pointer_cast<variable>(item.expr);
+                    const std::string& alias = item.alias.empty() ? var->name : item.alias;
+                    result_json += '"';
+                    result_json += alias;
+                    result_json += "\": ";
+
+                    auto it = context_.find(var->name);
+                    if (it != context_.end() && row < it->second.size()) {
+                        uint64_t id = it->second[row];
+                        auto& cache = batch_cache[var->name];
+                        auto cache_it = cache.find(id);
+                        if (cache_it != cache.end() && !cache_it->second.empty()) {
+                            result_json += cache_it->second;
                         } else {
-                            result_json += "null";
-                        }
-                    }
-                } else {
-                    result_json += "null";
-                }
-            } else if (item.expr->type() == node_type::property_access) {
-                auto pa = std::dynamic_pointer_cast<property_access>(item.expr);
-                const std::string& alias = item.alias.empty() ? pa->variable_name + "." + pa->property_key : item.alias;
-                result_json += '"';
-                result_json += alias;
-                result_json += "\": ";
-
-                auto it = context_.find(pa->variable_name);
-                if (it != context_.end() && row < it->second.size()) {
-                    uint64_t id = it->second[row];
-                    auto& cache = var_props_cache[pa->variable_name];
-                    auto cache_it = cache.find(id);
-                    std::string props;
-                    if (cache_it != cache.end()) {
-                        props = cache_it->second;
-                    }
-                    if (!props.empty()) {
-                        std::string val = get_json_value(props, pa->property_key);
-                        if (!val.empty()) {
-                            bool is_num = !val.empty() && (std::isdigit(static_cast<unsigned char>(val[0])) || val[0] == '-');
-                            if (is_num) {
-                                result_json += val;
+                            edge_data ed;
+                            if (store_.get_edge(tx_, id, ed)) {
+                                result_json += "{\"_id\": ";
+                                result_json += std::to_string(id);
+                                result_json += ", \"_from\": ";
+                                result_json += std::to_string(ed.from_id);
+                                result_json += ", \"_to\": ";
+                                result_json += std::to_string(ed.to_id);
+                                result_json += ", \"_label\": \"";
+                                result_json += ed.label;
+                                result_json += '"';
+                                if (!ed.properties.empty() && ed.properties != "{}") {
+                                    result_json += ", \"_properties\": ";
+                                    result_json += ed.properties;
+                                }
+                                result_json += '}';
                             } else {
-                                result_json += '"';
-                                result_json += val;
-                                result_json += '"';
+                                result_json += "null";
+                            }
+                        }
+                    } else {
+                        result_json += "null";
+                    }
+                } else if (item.expr->type() == node_type::property_access) {
+                    auto pa = std::dynamic_pointer_cast<property_access>(item.expr);
+                    const std::string& alias = item.alias.empty() ? pa->variable_name + "." + pa->property_key : item.alias;
+                    result_json += '"';
+                    result_json += alias;
+                    result_json += "\": ";
+
+                    auto it = context_.find(pa->variable_name);
+                    if (it != context_.end() && row < it->second.size()) {
+                        uint64_t id = it->second[row];
+                        auto& cache = batch_cache[pa->variable_name];
+                        auto cache_it = cache.find(id);
+                        std::string props;
+                        if (cache_it != cache.end()) {
+                            props = cache_it->second;
+                        }
+                        if (!props.empty()) {
+                            std::string val = get_json_value(props, pa->property_key);
+                            if (!val.empty()) {
+                                bool is_num = !val.empty() && (std::isdigit(static_cast<unsigned char>(val[0])) || val[0] == '-');
+                                if (is_num) {
+                                    result_json += val;
+                                } else {
+                                    result_json += '"';
+                                    result_json += val;
+                                    result_json += '"';
+                                }
+                            } else {
+                                result_json += "null";
                             }
                         } else {
                             result_json += "null";
@@ -577,12 +595,11 @@ bool executor::execute_return(const std::shared_ptr<return_clause>& ret, std::st
                     } else {
                         result_json += "null";
                     }
-                } else {
-                    result_json += "null";
                 }
             }
+            result_json += '}';
         }
-        result_json += '}';
+        // batch_cache goes out of scope — memory freed before next batch
     }
     result_json += ']';
     return true;

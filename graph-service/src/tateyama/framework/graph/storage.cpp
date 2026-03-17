@@ -167,7 +167,6 @@ bool storage::update_node(TransactionHandle tx, uint64_t node_id, std::string_vi
 // Forward declarations for helpers defined later in this file
 static std::vector<std::pair<std::string, std::string>> parse_json_properties(std::string_view json);
 static Slice build_prop_index_key(std::string_view label, std::string_view prop_key, std::string_view prop_value);
-static std::string append_packed_id(std::string_view existing, uint64_t node_id);
 static std::string remove_packed_id(std::string_view existing, uint64_t node_id);
 
 bool storage::update_node_with_label(TransactionHandle tx, uint64_t node_id, std::string_view label, std::string_view new_properties) {
@@ -217,9 +216,12 @@ bool storage::update_node_with_label(TransactionHandle tx, uint64_t node_id, std
                         if (content_get(tx, property_index_handle_, idx_key, &existing) == StatusCode::OK) {
                             existing_str.assign(existing.data<char>(), existing.size());
                         }
-                        std::string appended = append_packed_id(existing_str, node_id);
+                        // ADR-0012: In-place append avoids O(N) copy
+                        char append_buf[8];
+                        write_key(append_buf, node_id);
+                        existing_str.append(append_buf, 8);
                         idx_key = build_prop_index_key(label, key, new_val);
-                        content_put(tx, property_index_handle_, idx_key, Slice(appended), PutOperation::CREATE_OR_UPDATE);
+                        content_put(tx, property_index_handle_, idx_key, Slice(existing_str), PutOperation::CREATE_OR_UPDATE);
                     }
                 }
             }
@@ -418,6 +420,76 @@ bool storage::find_nodes_by_label(TransactionHandle tx, std::string_view label, 
     return true;
 }
 
+// --- label_iterator implementation (ADR-0012) ---
+
+label_iterator::label_iterator(TransactionHandle tx, StorageHandle label_index,
+                               StorageHandle nodes, std::string_view label)
+    : tx_(tx), nodes_(nodes), it_(nullptr), label_(label),
+      current_id_(0), valid_(false)
+{
+    Slice prefix(label_);
+    if (prefix_scan(tx, label_index, prefix, &it_) != StatusCode::OK) {
+        it_ = nullptr;
+    }
+}
+
+label_iterator::~label_iterator() {
+    if (it_) iterator_dispose(it_);
+}
+
+label_iterator::label_iterator(label_iterator&& o) noexcept
+    : tx_(o.tx_), nodes_(o.nodes_), it_(o.it_), label_(std::move(o.label_)),
+      current_id_(o.current_id_), valid_(o.valid_)
+{
+    o.it_ = nullptr;
+    o.valid_ = false;
+}
+
+label_iterator& label_iterator::operator=(label_iterator&& o) noexcept {
+    if (this != &o) {
+        if (it_) iterator_dispose(it_);
+        tx_ = o.tx_;
+        nodes_ = o.nodes_;
+        it_ = o.it_;
+        label_ = std::move(o.label_);
+        current_id_ = o.current_id_;
+        valid_ = o.valid_;
+        o.it_ = nullptr;
+        o.valid_ = false;
+    }
+    return *this;
+}
+
+bool label_iterator::next() {
+    if (!it_) return false;
+    if (iterator_next(it_) != StatusCode::OK) { valid_ = false; return false; }
+    Slice key;
+    if (iterator_get_key(it_, &key) != StatusCode::OK) { valid_ = false; return false; }
+    if (key.size() < label_.size() + 8) { valid_ = false; return false; }
+    const char* kp = key.data<char>();
+    if (std::memcmp(kp, label_.data(), label_.size()) != 0) {
+        valid_ = false;
+        return false;
+    }
+    current_id_ = from_key_ptr(kp + label_.size());
+    valid_ = true;
+    return true;
+}
+
+bool label_iterator::get_properties(std::string& out) const {
+    if (!valid_) return false;
+    char key_buf[8];
+    Slice value;
+    if (content_get(tx_, nodes_, to_key_slice(key_buf, current_id_), &value) != StatusCode::OK)
+        return false;
+    out.assign(value.data<char>(), value.size());
+    return true;
+}
+
+label_iterator storage::find_nodes_by_label_iter(TransactionHandle tx, std::string_view label) {
+    return label_iterator(tx, label_index_handle_, nodes_handle_, label);
+}
+
 // --- JSON Property Parsing Helper ---
 
 static std::vector<std::pair<std::string, std::string>> parse_json_properties(std::string_view json) {
@@ -483,17 +555,6 @@ static Slice build_prop_index_key(std::string_view label, std::string_view prop_
     return Slice(key);
 }
 
-// Append a node_id to a packed ID list
-static std::string append_packed_id(std::string_view existing, uint64_t node_id) {
-    std::string result;
-    result.reserve(existing.size() + 8);
-    result.append(existing);
-    char buf[8];
-    write_key(buf, node_id);
-    result.append(buf, 8);
-    return result;
-}
-
 // Remove a node_id from a packed ID list
 static std::string remove_packed_id(std::string_view existing, uint64_t node_id) {
     std::string result;
@@ -542,9 +603,12 @@ bool storage::index_node_properties(TransactionHandle tx, uint64_t node_id, std:
             existing_str.assign(existing.data<char>(), existing.size());
         }
 
-        std::string new_value = append_packed_id(existing_str, node_id);
+        // ADR-0012: In-place append avoids O(N) copy
+        char append_buf[8];
+        write_key(append_buf, node_id);
+        existing_str.append(append_buf, 8);
         idx_key = build_prop_index_key(label, key, value);
-        if (content_put(tx, property_index_handle_, idx_key, Slice(new_value), PutOperation::CREATE_OR_UPDATE) != StatusCode::OK) {
+        if (content_put(tx, property_index_handle_, idx_key, Slice(existing_str), PutOperation::CREATE_OR_UPDATE) != StatusCode::OK) {
             LOG(WARNING) << "Failed to index property " << key << " for node " << node_id;
         }
     }

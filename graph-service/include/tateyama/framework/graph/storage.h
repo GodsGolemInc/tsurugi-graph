@@ -4,6 +4,7 @@
 #include <string_view>
 #include <memory>
 #include <vector>
+#include <cstring>
 #include <sharksfin/api.h>
 
 namespace tateyama::framework::graph {
@@ -13,6 +14,38 @@ struct edge_data {
     uint64_t to_id;
     std::string label;
     std::string properties;
+};
+
+// ADR-0012: Streaming label scan iterator — avoids materializing all IDs at once
+class label_iterator {
+public:
+    label_iterator() = default;
+    label_iterator(sharksfin::TransactionHandle tx,
+                   sharksfin::StorageHandle label_index,
+                   sharksfin::StorageHandle nodes,
+                   std::string_view label);
+    ~label_iterator();
+
+    // Advance to next node. Returns false when exhausted.
+    bool next();
+    // Current node ID (valid after successful next())
+    uint64_t node_id() const { return current_id_; }
+    // Lazy property read for current node
+    bool get_properties(std::string& out) const;
+
+    // Non-copyable, movable
+    label_iterator(const label_iterator&) = delete;
+    label_iterator& operator=(const label_iterator&) = delete;
+    label_iterator(label_iterator&& o) noexcept;
+    label_iterator& operator=(label_iterator&& o) noexcept;
+
+private:
+    sharksfin::TransactionHandle tx_{};
+    sharksfin::StorageHandle nodes_{};
+    sharksfin::IteratorHandle it_{};
+    std::string label_;
+    uint64_t current_id_{0};
+    bool valid_{false};
 };
 
 class storage {
@@ -48,6 +81,8 @@ public:
     bool get_outgoing_edges(sharksfin::TransactionHandle tx, uint64_t node_id, std::vector<uint64_t>& out_edge_ids);
     bool get_incoming_edges(sharksfin::TransactionHandle tx, uint64_t node_id, std::vector<uint64_t>& out_edge_ids);
     bool find_nodes_by_label(sharksfin::TransactionHandle tx, std::string_view label, std::vector<uint64_t>& out_node_ids);
+    // ADR-0012: Streaming label scan — returns iterator instead of materializing all IDs
+    label_iterator find_nodes_by_label_iter(sharksfin::TransactionHandle tx, std::string_view label);
 
     // Property index operations (ADR-0002)
     bool index_node_properties(sharksfin::TransactionHandle tx, uint64_t node_id, std::string_view label, std::string_view properties);
