@@ -147,7 +147,7 @@
 |:---|---:|---:|---:|---:|---:|
 | **CREATE node (individual)** | **47,761** | 77,786 | 770 | 1,939 | 203 |
 | **MATCH indexed = (point read)** | **46,060** | 1,605 | 743 | 1,090 | 448 |
-| **MATCH WHERE > (range index)** | 17 | 7 | 16 | **51** | 22 |
+| **MATCH WHERE > (range index)** | 8 | **91** | 16 | 51 | 22 |
 | **Edge traversal** | **120,171** | 100,269 | 742 | 754 | 355 |
 | **Pipeline (CREATE+MATCH+SET+RETURN)** | **10,657** | 7,422 | N/A | N/A | N/A |
 
@@ -197,15 +197,17 @@
 
 | Database | Ops | Time (sec) | Ops/sec | Latency/query |
 |:---|---:|---:|---:|---:|
-| FalkorDB | 100 | 1.98 | **51** | 19.8ms |
+| **tsurugi-graph (mock)** | 100 | 1.10 | **91** | 11.0ms |
+| FalkorDB | 100 | 1.98 | 51 | 19.8ms |
 | Neo4j | 100 | 4.55 | 22 | 45.5ms |
 | Memgraph | 100 | 6.28 | 16 | 62.8ms |
-| tsurugi-graph | 100 | 15.18 | 7 | 151.8ms |
+| tsurugi-graph (Shirakami) | 100 | 13.33 | 8 | 133.3ms |
 
 **Analysis:**
-- FalkorDB excels at full scans due to GraphBLAS columnar property storage — packed integer arrays are cache-friendly and potentially SIMD-vectorized.
-- tsurugi-graph is slowest because: (1) `std::map` iterator pointer-chasing is cache-unfriendly, (2) each node's properties are stored as JSON strings requiring per-node parse, (3) no columnar property layout.
-- Production Shirakami's sequential B+tree scan will improve cache locality but cannot match columnar engines.
+- ADR-0010 (range property index) improved tsurugi-graph's range WHERE from 7 to **91 ops/s** (13x) on mock, making it the fastest engine for this workload. The inverted index prefix scan eliminates per-node property reads.
+- tsurugi-graph (mock) now **1.8x faster** than FalkorDB despite FalkorDB's GraphBLAS columnar storage.
+- On real Shirakami, the KVS B+tree scan I/O dominates (8 ops/s). Each range query iterates all distinct property values in the Masstree, which involves pointer-chasing through tree nodes — an inherent cost of the B+tree structure vs. columnar/packed arrays.
+- Future optimization: sorted numeric key encoding would enable Shirakami range scans to skip non-matching values.
 
 #### 5. CREATE Edge (MATCH source + MATCH target + CREATE edge, 10K operations)
 
