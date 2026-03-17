@@ -98,11 +98,13 @@ set(MOCK_TESTS
     executor_test
     executor_advanced_test
     executor_batch_test
+    executor_coverage_test
     storage_standalone_test
     storage_label_test
     storage_navigation_test
     storage_property_test
     storage_iterator_test
+    storage_coverage_test
     match_label_test
 )
 
@@ -115,6 +117,7 @@ set(PARSER_ONLY_TESTS
     parser_full_test
     parser_edge_test
     parser_property_test
+    parser_coverage_test
     query_cache_test
 )
 

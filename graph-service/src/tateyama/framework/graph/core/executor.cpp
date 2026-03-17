@@ -400,10 +400,14 @@ bool executor::execute_where(const std::shared_ptr<where_clause>& where) {
             try { node_val = std::stod(val); } catch (...) { return false; }
             if (op == ">") return node_val > compare_numeric;
             if (op == "<") return node_val < compare_numeric;
+            if (op == ">=") return node_val >= compare_numeric;
+            if (op == "<=") return node_val <= compare_numeric;
             if (op == "<>") return node_val != compare_numeric;
         } else {
             if (op == ">") return val > compare_value;
             if (op == "<") return val < compare_value;
+            if (op == ">=") return val >= compare_value;
+            if (op == "<=") return val <= compare_value;
             if (op == "<>") return val != compare_value;
         }
         return false;

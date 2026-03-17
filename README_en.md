@@ -55,7 +55,7 @@ Shirakami KVS ── Masstree B+tree, MVCC, WAL
 | CREATE (edge) | `CREATE (a:Person)-[r:KNOWS]->(b:Person)` |
 | MATCH | `MATCH (n:Person) RETURN n` |
 | MATCH (edge) | `MATCH (a)-[r:KNOWS]->(b) RETURN a, b` |
-| WHERE (=, >, <, <>) | `MATCH (n) WHERE n.age > 30 RETURN n` |
+| WHERE (=, >, <, >=, <=, <>) | `MATCH (n) WHERE n.age >= 30 RETURN n` |
 | SET | `MATCH (n) SET n.age = 31 RETURN n` |
 | DELETE | `MATCH (n:Person) DELETE n` |
 | DETACH DELETE | `MATCH (n:Person) DETACH DELETE n` |
@@ -115,13 +115,13 @@ Clients connect via the Tateyama protocol (IPC/TCP), sending Cypher queries to s
 
 ## Tests
 
-14 test files with 119 test cases, all using the mock Shirakami backend.
+17 test files with 148 test cases, all using the mock Shirakami backend. 100% pass rate.
 
 | Component | Test Files | Cases |
 |:--|:--|---:|
-| Parser | parser_standalone, parser_full, parser_edge, parser_property | 30 |
-| Storage | storage_standalone, storage_label, storage_navigation, storage_property, storage_iterator | 26 |
-| Executor | executor, executor_advanced, executor_batch | 27 |
+| Parser | parser_standalone, parser_full, parser_edge, parser_property, parser_coverage | 40 |
+| Storage | storage_standalone, storage_label, storage_navigation, storage_property, storage_iterator, storage_coverage | 36 |
+| Executor | executor, executor_advanced, executor_batch, executor_coverage | 36 |
 | Query Cache | query_cache | 35 |
 | Match Label | match_label | 1 |
 
@@ -184,7 +184,7 @@ tsurugi-graph/
 │   │   └── tateyama/framework/graph/
 │   │       ├── service.cpp, resource.cpp, storage.cpp
 │   │       └── core/ (parser.cpp, executor.cpp)
-│   ├── test/              # Tests (14 files, 119 cases)
+│   ├── test/              # Tests (17 files, 148 cases)
 │   ├── bench/             # Benchmarks
 │   └── docs/adr/          # ADRs (0001-0012)
 └── build/
