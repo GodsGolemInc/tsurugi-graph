@@ -38,6 +38,39 @@ static inline uint64_t from_key(std::string_view s) {
     return from_key_ptr(s.data());
 }
 
+// ADR-0013: IEEE 754 double → 8-byte sortable binary
+// Positive/zero: flip MSB (0→1) so byte order = numeric order
+// Negative: flip all bits so byte order = numeric order (larger negative = smaller bytes)
+static inline void encode_sortable_double(char* buf, double val) {
+    uint64_t bits;
+    std::memcpy(&bits, &val, 8);
+    if (bits & (1ULL << 63)) {
+        bits = ~bits;           // negative: flip all bits
+    } else {
+        bits ^= (1ULL << 63);  // positive/zero: flip MSB
+    }
+    uint64_t be = __builtin_bswap64(bits);
+    std::memcpy(buf, &be, 8);
+}
+
+static inline double decode_sortable_double(const char* buf) {
+    uint64_t be;
+    std::memcpy(&be, buf, 8);
+    uint64_t bits = __builtin_bswap64(be);
+    if (bits & (1ULL << 63)) {
+        bits ^= (1ULL << 63);  // positive/zero: flip MSB back
+    } else {
+        bits = ~bits;           // negative: flip all bits back
+    }
+    double val;
+    std::memcpy(&val, &bits, 8);
+    return val;
+}
+
+// Type prefix constants for property index key encoding
+static constexpr char PROP_TYPE_NUMERIC = '\x01';
+static constexpr char PROP_TYPE_STRING  = '\x02';
+
 // RAII guard for iterator handles to prevent resource leaks
 class iterator_guard {
 public:
@@ -540,18 +573,37 @@ static std::vector<std::pair<std::string, std::string>> parse_json_properties(st
     return result;
 }
 
-// ADR-0007: Inverted property index key: label + '\0' + prop_key + '\0' + prop_value
+// ADR-0007/0013: Inverted property index key with sortable numeric encoding
+// Key format: label + '\0' + prop_key + '\0' + type_prefix + encoded_value
+//   Numeric: type_prefix = \x01, value = 8-byte sortable IEEE 754
+//   String:  type_prefix = \x02, value = raw string
 // Value is packed node_id list (8 bytes each, big-endian)
 // Returns Slice pointing to thread_local buffer — valid until next call
 static Slice build_prop_index_key(std::string_view label, std::string_view prop_key, std::string_view prop_value) {
     thread_local std::string key;
     key.clear();
-    key.reserve(label.size() + 1 + prop_key.size() + 1 + prop_value.size());
+    key.reserve(label.size() + 1 + prop_key.size() + 1 + 1 + 8);
     key.append(label);
     key.push_back('\0');
     key.append(prop_key);
     key.push_back('\0');
-    key.append(prop_value);
+
+    // Try numeric encoding for sortable key order
+    bool numeric = false;
+    double num_val = 0;
+    if (!prop_value.empty()) {
+        try { num_val = std::stod(std::string(prop_value)); numeric = true; } catch (...) {}
+    }
+
+    if (numeric) {
+        key.push_back(PROP_TYPE_NUMERIC);
+        char enc[8];
+        encode_sortable_double(enc, num_val);
+        key.append(enc, 8);
+    } else {
+        key.push_back(PROP_TYPE_STRING);
+        key.append(prop_value);
+    }
     return Slice(key);
 }
 
@@ -638,18 +690,76 @@ bool storage::find_nodes_by_property_range(TransactionHandle tx, std::string_vie
     prefix_str.push_back('\0');
     prefix_str.append(prop_key);
     prefix_str.push_back('\0');
-    Slice prefix(prefix_str);
-
-    // Scan all entries with this prefix
-    IteratorHandle it = nullptr;
-    if (prefix_scan(tx, property_index_handle_, prefix, &it) != StatusCode::OK) {
-        return true;  // No index entries — empty result
-    }
-    iterator_guard ig(it);
 
     bool is_numeric = false;
     double compare_num = 0;
     try { compare_num = std::stod(compare_value); is_numeric = true; } catch (...) {}
+
+    IteratorHandle it = nullptr;
+
+    // ADR-0013: Use sortable numeric encoding for range scan
+    if (is_numeric && op != "<>") {
+        char threshold_enc[8];
+        encode_sortable_double(threshold_enc, compare_num);
+
+        thread_local std::string begin_key, end_key;
+
+        if (op == ">" || op == ">=") {
+            // Scan from threshold to end of numeric range
+            begin_key = prefix_str;
+            begin_key.push_back(PROP_TYPE_NUMERIC);
+            begin_key.append(threshold_enc, 8);
+
+            end_key = prefix_str;
+            end_key.push_back(PROP_TYPE_STRING);  // stop before string values
+
+            auto begin_kind = (op == ">") ? EndPointKind::EXCLUSIVE : EndPointKind::INCLUSIVE;
+            if (content_scan(tx, property_index_handle_,
+                    Slice(begin_key), begin_kind,
+                    Slice(end_key), EndPointKind::EXCLUSIVE, &it) != StatusCode::OK) {
+                return true;
+            }
+        } else {  // "<" or "<="
+            // Scan from start of numeric range to threshold
+            begin_key = prefix_str;
+            begin_key.push_back(PROP_TYPE_NUMERIC);
+
+            end_key = prefix_str;
+            end_key.push_back(PROP_TYPE_NUMERIC);
+            end_key.append(threshold_enc, 8);
+
+            auto end_kind = (op == "<=") ? EndPointKind::INCLUSIVE : EndPointKind::EXCLUSIVE;
+            if (content_scan(tx, property_index_handle_,
+                    Slice(begin_key), EndPointKind::INCLUSIVE,
+                    Slice(end_key), end_kind, &it) != StatusCode::OK) {
+                return true;
+            }
+        }
+
+        iterator_guard ig(it);
+        size_t prefix_len = prefix_str.size();
+
+        // All iterated entries match — no per-entry comparison needed
+        while (iterator_next(it) == StatusCode::OK) {
+            Slice key, value;
+            if (iterator_get_key(it, &key) != StatusCode::OK) break;
+            if (iterator_get_value(it, &value) != StatusCode::OK) break;
+
+            // Verify still within our prefix (safety check)
+            if (key.size() < prefix_len ||
+                std::memcmp(key.data<char>(), prefix_str.data(), prefix_len) != 0) break;
+
+            unpack_ids(std::string_view(value.data<char>(), value.size()), out_node_ids);
+        }
+        return true;
+    }
+
+    // Fallback: prefix scan for <> (not-equal) or string comparison
+    Slice prefix(prefix_str);
+    if (prefix_scan(tx, property_index_handle_, prefix, &it) != StatusCode::OK) {
+        return true;
+    }
+    iterator_guard ig(it);
 
     size_t prefix_len = prefix_str.size();
 
@@ -658,23 +768,25 @@ bool storage::find_nodes_by_property_range(TransactionHandle tx, std::string_vie
         if (iterator_get_key(it, &key) != StatusCode::OK) break;
         if (iterator_get_value(it, &value) != StatusCode::OK) break;
 
-        // Check prefix match (iterator may go beyond prefix in mock/real)
         if (key.size() < prefix_len ||
             std::memcmp(key.data<char>(), prefix_str.data(), prefix_len) != 0) break;
 
-        // Extract prop_value from key (after prefix)
-        std::string_view prop_value(key.data<char>() + prefix_len, key.size() - prefix_len);
+        // Extract type prefix and value after prefix
+        if (key.size() <= prefix_len) continue;
+        char type_prefix = key.data<char>()[prefix_len];
 
         bool match = false;
-        if (is_numeric) {
-            double val_num;
-            try { val_num = std::stod(std::string(prop_value)); } catch (...) { continue; }
-            if (op == ">") match = val_num > compare_num;
-            else if (op == "<") match = val_num < compare_num;
-            else if (op == ">=") match = val_num >= compare_num;
-            else if (op == "<=") match = val_num <= compare_num;
-            else if (op == "<>") match = val_num != compare_num;
-        } else {
+        if (type_prefix == PROP_TYPE_NUMERIC && key.size() >= prefix_len + 1 + 8) {
+            double val_num = decode_sortable_double(key.data<char>() + prefix_len + 1);
+            if (is_numeric) {
+                if (op == "<>") match = val_num != compare_num;
+                else if (op == ">") match = val_num > compare_num;
+                else if (op == "<") match = val_num < compare_num;
+                else if (op == ">=") match = val_num >= compare_num;
+                else if (op == "<=") match = val_num <= compare_num;
+            }
+        } else if (type_prefix == PROP_TYPE_STRING) {
+            std::string_view prop_value(key.data<char>() + prefix_len + 1, key.size() - prefix_len - 1);
             std::string pv(prop_value);
             if (op == ">") match = pv > compare_value;
             else if (op == "<") match = pv < compare_value;

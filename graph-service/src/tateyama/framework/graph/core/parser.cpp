@@ -115,7 +115,12 @@ token lexer::scan_symbol() {
         case ',': return {token_type::comma, ",", start};
         case '.': return {token_type::dot, ".", start};
         case '=': return {token_type::equals, "=", start};
-        case '>': return {token_type::greater_than, ">", start};
+        case '>':
+            if (peek() == '=') {
+                advance();
+                return {token_type::greater_than, ">=", start};
+            }
+            return {token_type::greater_than, ">", start};
         case '<':
             if (peek() == '-') {
                 advance();
@@ -124,6 +129,10 @@ token lexer::scan_symbol() {
             if (peek() == '>') {
                 advance();
                 return {token_type::greater_than, "<>", start}; // not-equal operator
+            }
+            if (peek() == '=') {
+                advance();
+                return {token_type::less_than, "<=", start};
             }
             return {token_type::less_than, "<", start};
         case '-':

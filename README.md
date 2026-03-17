@@ -55,7 +55,7 @@ Shirakami KVS ── Masstree B+tree、MVCC、WAL
 | CREATE (エッジ) | `CREATE (a:Person)-[r:KNOWS]->(b:Person)` |
 | MATCH | `MATCH (n:Person) RETURN n` |
 | MATCH (エッジ) | `MATCH (a)-[r:KNOWS]->(b) RETURN a, b` |
-| WHERE (=, >, <, <>) | `MATCH (n) WHERE n.age > 30 RETURN n` |
+| WHERE (=, >, <, >=, <=, <>) | `MATCH (n) WHERE n.age >= 30 RETURN n` |
 | SET | `MATCH (n) SET n.age = 31 RETURN n` |
 | DELETE | `MATCH (n:Person) DELETE n` |
 | DETACH DELETE | `MATCH (n:Person) DETACH DELETE n` |
@@ -115,13 +115,13 @@ tgctl shutdown  # 停止
 
 ## テスト
 
-14 テストファイル、119 テストケース。モック Shirakami バックエンド使用。
+17 テストファイル、153 テストケース。モック Shirakami バックエンド使用。100% 通過率。
 
 | コンポーネント | テストファイル | ケース数 |
 |:--|:--|---:|
-| パーサ | parser_standalone, parser_full, parser_edge, parser_property | 30 |
-| ストレージ | storage_standalone, storage_label, storage_navigation, storage_property, storage_iterator | 26 |
-| エグゼキュータ | executor, executor_advanced, executor_batch | 27 |
+| パーサ | parser_standalone, parser_full, parser_edge, parser_property, parser_coverage | 40 |
+| ストレージ | storage_standalone, storage_label, storage_navigation, storage_property, storage_iterator, storage_coverage | 41 |
+| エグゼキュータ | executor, executor_advanced, executor_batch, executor_coverage | 36 |
 | クエリキャッシュ | query_cache | 35 |
 | ラベルマッチ | match_label | 1 |
 
@@ -164,6 +164,7 @@ tgctl shutdown  # 停止
 | 0010 | 範囲プロパティインデックス | 不等号 WHERE O(V) |
 | 0011 | クエリテンプレートキャッシュ | リテラル正規化で命中率向上 |
 | 0012 | ストリーミングエグゼキュータ | ピークメモリ 5GB→100MB |
+| 0013 | ソート可能数値キー | 範囲スキャン最適化、IEEE 754 バイナリエンコーディング |
 
 ## ディレクトリ構成
 
@@ -184,7 +185,7 @@ tsurugi-graph/
 │   │   └── tateyama/framework/graph/
 │   │       ├── service.cpp, resource.cpp, storage.cpp
 │   │       └── core/ (parser.cpp, executor.cpp)
-│   ├── test/              # テスト (14ファイル, 119ケース)
+│   ├── test/              # テスト (17ファイル, 148ケース)
 │   ├── bench/             # ベンチマーク
 │   └── docs/adr/          # ADR (0001-0012)
 └── build/
