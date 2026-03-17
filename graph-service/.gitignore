@@ -1,0 +1,48 @@
+# Build artifacts
+build/
+cmake-build-*/
+
+# Compiled binaries (bench/)
+graph_bench
+real_bench
+concurrent_bench
+load_test_bench
+
+# Compiled test binaries (bench/)
+storage_test
+storage_nav_test
+storage_standalone_test
+executor_test
+parser_test
+parser_full_test
+edge_parser_test
+label_test
+match_label_test
+service_logic_test
+service_logic_standalone_test
+storage_navigation_test
+storage_property_test
+query_cache_test
+executor_advanced_test
+parser_property_test
+
+# Object files
+*.o
+*.a
+*.so
+*.so.*
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Benchmark tools & data (external binaries, not source-managed)
+bench/tools/
+bench/bench_data/
+
+# OS
+.DS_Store
+Thumbs.db
