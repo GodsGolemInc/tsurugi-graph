@@ -97,10 +97,12 @@ set(GRAPH_SRC_FILES
 set(MOCK_TESTS
     executor_test
     executor_advanced_test
+    executor_batch_test
     storage_standalone_test
     storage_label_test
     storage_navigation_test
     storage_property_test
+    storage_iterator_test
     match_label_test
 )
 

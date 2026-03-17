@@ -33,6 +33,7 @@ private:
     std::map<std::string, unwind_binding> unwind_context_;
 
     static constexpr size_t PARALLEL_THRESHOLD = 10000;
+    static constexpr size_t BATCH_SIZE = 1024;
 
     bool execute_create(const std::shared_ptr<create_clause>& create);
     bool execute_match(const std::shared_ptr<match_clause>& match);

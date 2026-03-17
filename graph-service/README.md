@@ -61,7 +61,7 @@ g++ -std=c++17 -I include -I test \
 
 ## Tests
 
-12 standalone test files with 110 test cases, all using the mock Shirakami backend (`test/sharksfin/api.h`).
+14 standalone test files with 119 test cases, all using the mock Shirakami backend (`test/sharksfin/api.h`).
 
 ### Run all tests
 
@@ -81,8 +81,8 @@ g++ -std=c++17 -I include -I test -I test/tateyama/framework/graph \
 | Component | Test files | Cases | Coverage |
 |:--|:--|---:|:--|
 | Parser (lexer + AST) | parser_standalone, parser_full, parser_edge, parser_property | 30 | All clause types, edge patterns, literals, tokens |
-| Storage | storage_standalone, storage_label, storage_navigation, storage_property | 22 | All 18 public APIs |
-| Executor | executor, executor_advanced | 22 | All clause handlers, range WHERE, indexed MATCH, pipeline |
+| Storage | storage_standalone, storage_label, storage_navigation, storage_property, storage_iterator | 26 | All 18 public APIs + label_iterator |
+| Executor | executor, executor_advanced, executor_batch | 27 | All clause handlers, range WHERE, indexed MATCH, pipeline, batched RETURN/WHERE |
 | Query Cache | query_cache | 35 | normalize, clone, deep_copy, bind, LRU, cache ops |
 | Match Label | match_label | 1 | Label-based MATCH execution |
 
@@ -108,6 +108,7 @@ See `bench/` for performance benchmarks:
 | 0009 | Optimistic Index Write |
 | 0010 | Range Property Index |
 | 0011 | Query Template Cache |
+| 0012 | Streaming Executor |
 
 ## Service ID
 
