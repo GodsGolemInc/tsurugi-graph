@@ -348,15 +348,15 @@ bool executor::execute_where(const std::shared_ptr<where_clause>& where) {
         if (label_it != context_labels_.end() && !label_it->second.empty()) {
             std::vector<uint64_t> index_results;
             if (store_.find_nodes_by_property(tx_, label_it->second, prop_key, compare_value, index_results)) {
-                // Intersect index results with current context
-                std::set<uint64_t> index_set(index_results.begin(), index_results.end());
+                // Sorted merge intersection: O(N+M) vs O(N log N) set-based
+                std::sort(index_results.begin(), index_results.end());
+                std::sort(it->second.begin(), it->second.end());
                 std::vector<uint64_t> filtered;
                 filtered.reserve(std::min(it->second.size(), index_results.size()));
-                for (uint64_t id : it->second) {
-                    if (index_set.count(id)) {
-                        filtered.push_back(id);
-                    }
-                }
+                std::set_intersection(
+                    it->second.begin(), it->second.end(),
+                    index_results.begin(), index_results.end(),
+                    std::back_inserter(filtered));
                 it->second = std::move(filtered);
                 return true;
             }
@@ -370,12 +370,15 @@ bool executor::execute_where(const std::shared_ptr<where_clause>& where) {
         if (label_it != context_labels_.end() && !label_it->second.empty()) {
             std::vector<uint64_t> range_results;
             if (store_.find_nodes_by_property_range(tx_, label_it->second, prop_key, op, compare_value, range_results)) {
-                std::set<uint64_t> range_set(range_results.begin(), range_results.end());
+                // Sorted merge intersection: O(N+M) vs O(N log N) set-based
+                std::sort(range_results.begin(), range_results.end());
+                std::sort(it->second.begin(), it->second.end());
                 std::vector<uint64_t> filtered;
                 filtered.reserve(std::min(it->second.size(), range_results.size()));
-                for (uint64_t id : it->second) {
-                    if (range_set.count(id)) filtered.push_back(id);
-                }
+                std::set_intersection(
+                    it->second.begin(), it->second.end(),
+                    range_results.begin(), range_results.end(),
+                    std::back_inserter(filtered));
                 it->second = std::move(filtered);
                 return true;
             }
